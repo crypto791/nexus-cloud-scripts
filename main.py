@@ -36,7 +36,7 @@ def owned(conn,pid,user):
     return row
 
 def summary(row):
-    return {k:row[k] for k in ('id','name','description','visibility','updated_at','created_at','views','executions')}
+    return {k:row[k] for k in ('id','name','description','visibility','updated_at','created_at','views','executions','ticket_seconds')}
 class Credentials(BaseModel):
     username:str=Field(min_length=3,max_length=32,pattern=r'^[a-zA-Z0-9_]+$')
     password:str=Field(min_length=8,max_length=128)
@@ -45,6 +45,8 @@ class ScriptInput(BaseModel):
     description:str=Field(default='',max_length=1000)
     script:str=Field(default='',max_length=200000)
     visibility:str=Field(default='private',pattern='^(public|private)$')
+class TicketSettings(BaseModel):
+    seconds:int=Field(ge=30,le=3600)
 class TicketInput(BaseModel):
     seconds:int=Field(default=60,ge=30,le=3600)
 @app.get('/health')
@@ -115,6 +117,26 @@ def raw(pid:str):
         row=conn.execute("update panels set views=views+1 where id=%s and visibility='public' returning script",(pid,)).fetchone()
     if not row: raise HTTPException(404,'RAW não disponível')
     return PlainTextResponse(row['script'],media_type='text/plain; charset=utf-8',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
+@app.put('/api/panels/{pid}/ticket-settings')
+def set_ticket_settings(pid:str,req:Request,data:TicketSettings):
+    user=auth(req)
+    with db() as conn:
+        owned(conn,pid,user)
+        conn.execute('update panels set ticket_seconds=%s where id=%s',(data.seconds,pid))
+    return {'ok':True,'ticket_seconds':data.seconds}
+
+@app.post('/api/execute/{pid}/ticket')
+def executor_ticket(pid:str):
+    # Ticket issued server-side using owner-configured lifetime, never supplied by the caller.
+    with db() as conn:
+        panel=conn.execute('select id,ticket_seconds from panels where id=%s',(pid,)).fetchone()
+        if not panel: raise HTTPException(404,'Script não encontrado')
+        token=secrets.token_urlsafe(32)
+        seconds=panel['ticket_seconds']
+        expiry=datetime.now(timezone.utc)+timedelta(seconds=seconds)
+        conn.execute('insert into tickets(token_hash,panel_id,expires_at) values (%s,%s,%s)',(hashlib.sha256(token.encode()).hexdigest(),pid,expiry))
+    return {'panel_id':pid,'ticket':token,'expires_in':seconds}
+
 @app.post('/api/panels/{pid}/tickets')
 def issue(pid:str,req:Request,data:TicketInput):
     user=auth(req)
