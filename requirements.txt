@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+psycopg[binary]
+passlib
+python-multipart
+jinja2
+httpx
