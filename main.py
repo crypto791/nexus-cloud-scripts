@@ -1,443 +1,673 @@
-
 import os
 import json
 import time
-import httpx
+import hashlib
+import sqlite3
+from typing import Any
 
-from collections import defaultdict
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Nexus Scripts - Gemini Recorder")
 
-# CONFIGURAÇÃO
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+APP_VERSION = "4.7.0"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite"
+).strip()
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    + GEMINI_MODEL
-    + ":generateContent"
+    f"{GEMINI_MODEL}:generateContent"
 )
 
-MAX_EVENTS = 400
-MAX_REPORT_SIZE = 150000
-MAX_HISTORY = 12
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    "/tmp/nexus_cloud.sqlite3"
+)
 
-# DADOS EM MEMÓRIA
-latest_record = {
-    "category": "Nenhuma",
-    "events": [],
-    "received_at": None
-}
+MAX_EVENTS = 500
+MAX_EVENT_SIZE = 20000
+MAX_MESSAGE_LENGTH = 12000
 
-activity = {
-    "status": "Aguardando",
-    "message": "O Gemini ainda não recebeu nenhuma solicitação.",
-    "updated_at": None
-}
+app = FastAPI(
+    title="Nexus Cloud API",
+    version=APP_VERSION
+)
 
-# Limitação simples de requisições por IP
-request_counts = defaultdict(list)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def check_rate_limit(ip, limit=25, window=60):
-    now = time.time()
+# =========================================================
+# BANCO DE DADOS
+# =========================================================
 
-    request_counts[ip] = [
-        t for t in request_counts[ip]
-        if now - t < window
-    ]
+def get_db():
+    folder = os.path.dirname(DATABASE_PATH)
 
-    if len(request_counts[ip]) >= limit:
-        raise HTTPException(
-            429,
-            "Muitas requisições. Aguarde um pouco."
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_database():
+    db = get_db()
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            event_hash TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at REAL NOT NULL
         )
+    """)
 
-    request_counts[ip].append(now)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            report_id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
 
+    db.commit()
+    db.close()
+
+
+init_database()
+
+
+# =========================================================
+# UTILIDADES
+# =========================================================
+
+def current_time():
+    return int(time.time())
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str
+    )
+
+
+def content_hash(value: Any) -> str:
+    raw = canonical_json(value).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def safe_text(value: Any, limit=MAX_MESSAGE_LENGTH):
+    if value is None:
+        return ""
+
+    return str(value).strip()[:limit]
+
+
+def get_latest_report():
+    db = get_db()
+
+    row = db.execute("""
+        SELECT *
+        FROM reports
+        ORDER BY created_at DESC
+        LIMIT 1
+    """).fetchone()
+
+    db.close()
+
+    if not row:
+        return None
+
+    try:
+        report = json.loads(row["report_json"])
+    except Exception:
+        report = {}
+
+    return {
+        "report_id": row["report_id"],
+        "category": row["category"],
+        "event_count": row["event_count"],
+        "created_at": row["created_at"],
+        "events": report.get("events", [])
+    }
+
+
+# =========================================================
+# MODELOS
+# =========================================================
 
 class RecordRequest(BaseModel):
-    category: str = "Todos"
-    events: list = Field(default_factory=list)
-
-
-class AnalyzeRequest(BaseModel):
-    category: str = "Todos"
-    events: list = Field(default_factory=list)
+    category: str = "Roblox"
+    events: list[Any] = Field(default_factory=list)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list = Field(default_factory=list)
-    include_report: bool = False
+    message: str = ""
+    prompt: str = ""
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    context: Any = None
 
 
-def update_activity(status, message):
-    activity["status"] = status
-    activity["message"] = message[:1000]
-    activity["updated_at"] = time.time()
+class AnalyzeRequest(BaseModel):
+    report: Any = None
+    events: list[Any] = Field(default_factory=list)
+    category: str = "Roblox"
+    question: str = ""
 
 
-def extract_answer(data):
-    candidates = data.get("candidates", [])
+# =========================================================
+# GEMINI
+# =========================================================
 
-    if not candidates:
-        feedback = data.get("promptFeedback", {})
-        reason = feedback.get("blockReason", "Resposta indisponível")
-        raise HTTPException(502, f"Gemini não respondeu: {reason}")
-
-    parts = (
-        candidates[0]
-        .get("content", {})
-        .get("parts", [])
-    )
-
-    answer = "\n".join(
-        part.get("text", "")
-        for part in parts
-        if part.get("text")
-    )
-
-    if not answer:
-        raise HTTPException(502, "Resposta vazia do Gemini.")
-
-    return answer
-
-
-async def ask_gemini(contents, instruction):
+async def ask_gemini(
+    prompt: str,
+    history=None,
+    system_instruction=None
+):
     if not GEMINI_API_KEY:
         raise HTTPException(
-            500,
-            "GEMINI_API_KEY não configurada no Render."
+            status_code=503,
+            detail="GEMINI_API_KEY não configurada no Render."
         )
 
+    prompt = safe_text(prompt)
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail="Mensagem vazia."
+        )
+
+    contents = []
+
+    for item in (history or [])[-20:]:
+        role = str(item.get("role", "user")).lower()
+
+        if role not in ("user", "model"):
+            continue
+
+        message = safe_text(
+            item.get("text", item.get("message", ""))
+        )
+
+        if not message:
+            continue
+
+        contents.append({
+            "role": role,
+            "parts": [{"text": message}]
+        })
+
+    contents.append({
+        "role": "user",
+        "parts": [{"text": prompt}]
+    })
+
     payload = {
-        "systemInstruction": {
-            "parts": [{"text": instruction}]
-        },
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.6,
-            "maxOutputTokens": 3000
+            "temperature": 0.35,
+            "maxOutputTokens": 1800
         }
     }
 
+    if system_instruction:
+        payload["systemInstruction"] = {
+            "parts": [
+                {"text": safe_text(system_instruction, 5000)}
+            ]
+        }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
+                headers=headers,
                 json=payload
             )
 
         if response.status_code != 200:
             try:
-                error = response.json().get("error", {}).get(
-                    "message", "Erro na API Gemini"
-                )
+                error_data = response.json()
             except Exception:
-                error = "Erro na API Gemini"
+                error_data = response.text[:1000]
 
             raise HTTPException(
-                response.status_code,
-                error[:1000]
+                status_code=502,
+                detail={
+                    "message": "Erro retornado pelo Gemini.",
+                    "status": response.status_code,
+                    "error": error_data
+                }
             )
 
-        return extract_answer(response.json())
+        data = response.json()
+
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini não retornou uma resposta."
+            )
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        answer = "\n".join(
+            part.get("text", "")
+            for part in parts
+            if part.get("text")
+        ).strip()
+
+        if not answer:
+            raise HTTPException(
+                status_code=502,
+                detail="Resposta vazia do Gemini."
+            )
+
+        return answer
+
+    except HTTPException:
+        raise
 
     except httpx.TimeoutException:
-        raise HTTPException(504, "Gemini demorou para responder.")
+        raise HTTPException(
+            status_code=504,
+            detail="Tempo limite de conexão com Gemini."
+        )
 
-    except httpx.RequestError:
-        raise HTTPException(502, "Falha de conexão com Gemini.")
-
-
-INSTRUCTION = """
-Você é o Gemini integrado ao Action Recorder de uma experiência
-Roblox Luau.
-
-Você conversa com o usuário e analisa registros enviados pelo Recorder.
-
-REGRAS:
-- Explique os eventos de maneira organizada.
-- Diferencie fatos observados de hipóteses.
-- Não invente objetos, caminhos ou funções.
-- Não afirme que consegue ler o código interno de scripts
-  apenas pelos registros.
-- Quando receber relatórios, identifique objetos, caminhos,
-  alterações e sequências temporais.
-- Se não houver dados suficientes, diga o que está faltando.
-- Ao escreva codigos solicitados
-  e explique o que o código faz.
-- Responda em português quando o usuário escrever em português.
-"""
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha na comunicação com Gemini: {str(error)}"
+        )
 
 
-# PÁGINA SIMPLES PARA TESTAR A API
-PAGE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nexus Gemini</title>
-<style>
-body{background:#0b0d14;color:#eee;font-family:Arial;margin:0;padding:20px}
-main{max-width:850px;margin:auto}
-h1{color:#ff505d}
-.card{background:#151a27;border:1px solid #30384a;padding:15px;
-border-radius:12px;margin:15px 0}
-textarea{width:100%;box-sizing:border-box;min-height:130px;
-background:#090d16;color:white;border:1px solid #394258;
-border-radius:8px;padding:12px}
-button{background:#a72f3b;color:white;border:0;padding:12px;
-border-radius:8px;margin-top:10px;cursor:pointer}
-#answer{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
-small{color:#9ba5ba}
-</style>
-</head>
-<body>
-<main>
-<h1>NEXUS / GEMINI</h1>
-<small>Action Recorder AI - Painel de teste</small>
+# =========================================================
+# HEALTH
+# =========================================================
 
-<div class="card">
-<h3>Conversa</h3>
-<textarea id="message" placeholder="Digite uma mensagem para o Gemini..."></textarea>
-<br>
-<button onclick="chat()">Enviar mensagem</button>
-<button onclick="report()">Analisar último relatório</button>
-</div>
-
-<div class="card">
-<h3>Atividade do Gemini</h3>
-<div id="activity">Aguardando...</div>
-</div>
-
-<div class="card">
-<h3>Resposta</h3>
-<div id="answer">Nenhuma resposta ainda.</div>
-</div>
-</main>
-
-<script>
-async function chat(){
- const message=document.getElementById("message").value;
- if(!message.trim())return;
- document.getElementById("activity").textContent="Gemini está pensando...";
- try{
-  const r=await fetch("/api/chat",{
-   method:"POST",
-   headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({message:message})
-  });
-  const d=await r.json();
-  if(!r.ok)throw Error(d.detail||"Erro");
-  document.getElementById("answer").textContent=d.result;
-  document.getElementById("activity").textContent=d.activity;
- }catch(e){
-  document.getElementById("activity").textContent=e.message;
- }
-}
-
-async function report(){
- document.getElementById("activity").textContent="Analisando relatório...";
- try{
-  const r=await fetch("/api/analyze",{
-   method:"POST",
-   headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({category:"Todos",events:[]})
-  });
-  const d=await r.json();
-  if(!r.ok)throw Error(d.detail||"Erro");
-  document.getElementById("answer").textContent=d.result;
-  document.getElementById("activity").textContent=d.activity;
- }catch(e){
-  document.getElementById("activity").textContent=e.message;
- }
-}
-</script>
-</body>
-</html>
-"""
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return PAGE
+@app.get("/")
+async def root():
+    return {
+        "name": "Nexus Cloud",
+        "version": APP_VERSION,
+        "status": "online",
+        "health": "/api/health"
+    }
 
 
 @app.get("/api/health")
 async def health():
-    return {
-        "status": "online",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "model": GEMINI_MODEL,
-        "has_report": bool(latest_record["events"])
-    }
+    db = get_db()
 
+    event_count = db.execute(
+        "SELECT COUNT(*) FROM events"
+    ).fetchone()[0]
 
-# RECEBER RELATÓRIOS DO ROBLOX
-@app.post("/api/record")
-async def receive_record(data: RecordRequest, request: Request):
-    global latest_record
+    report_count = db.execute(
+        "SELECT COUNT(*) FROM reports"
+    ).fetchone()[0]
 
-    check_rate_limit(request.client.host if request.client else "unknown")
-
-    if len(data.events) > MAX_EVENTS:
-        raise HTTPException(413, "Limite de eventos excedido.")
-
-    serialized = json.dumps(data.events, ensure_ascii=False)
-
-    if len(serialized.encode("utf-8")) > MAX_REPORT_SIZE:
-        raise HTTPException(413, "Relatório muito grande.")
-
-    latest_record = {
-        "category": data.category[:40],
-        "events": data.events,
-        "received_at": time.time()
-    }
+    db.close()
 
     return {
         "success": True,
-        "received": len(data.events),
-        "message": "Relatório recebido."
+        "status": "online",
+        "version": APP_VERSION,
+        "gemini": {
+            "configured": bool(GEMINI_API_KEY),
+            "model": GEMINI_MODEL
+        },
+        "database": {
+            "available": True,
+            "events": event_count,
+            "reports": report_count
+        },
+        "latest_report": get_latest_report() is not None
     }
 
 
-# CONSULTAR ÚLTIMO RELATÓRIO
+# =========================================================
+# RECEBER RELATÓRIOS
+# =========================================================
+
+@app.post("/api/record")
+async def record_report(data: RecordRequest):
+    category = safe_text(data.category, 100) or "Roblox"
+
+    if not data.events:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum evento foi enviado."
+        )
+
+    if len(data.events) > MAX_EVENTS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Limite de {MAX_EVENTS} eventos por envio."
+        )
+
+    accepted = []
+    duplicate_count = 0
+
+    db = get_db()
+
+    try:
+        db.execute("BEGIN IMMEDIATE")
+
+        for event in data.events:
+            event_json = canonical_json(event)
+
+            if len(event_json.encode("utf-8")) > MAX_EVENT_SIZE:
+                continue
+
+            event_id = content_hash(event)
+
+            cursor = db.execute("""
+                INSERT OR IGNORE INTO events (
+                    event_hash,
+                    category,
+                    event_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                event_id,
+                category,
+                event_json,
+                time.time()
+            ))
+
+            if cursor.rowcount == 1:
+                accepted.append({
+                    "id": event_id,
+                    "event": event
+                })
+            else:
+                duplicate_count += 1
+
+        if not accepted:
+            db.commit()
+
+            latest = db.execute("""
+                SELECT report_id
+                FROM reports
+                ORDER BY created_at DESC
+                LIMIT 1
+            """).fetchone()
+
+            return {
+                "success": True,
+                "duplicate": True,
+                "message": "Todos os eventos já foram recebidos.",
+                "received": 0,
+                "duplicates": duplicate_count,
+                "report_id": latest["report_id"] if latest else None
+            }
+
+        report_events = [
+            item["event"]
+            for item in accepted
+        ]
+
+        report_id = content_hash(
+            sorted(item["id"] for item in accepted)
+        )
+
+        report_data = {
+            "category": category,
+            "events": report_events
+        }
+
+        db.execute("""
+            INSERT OR IGNORE INTO reports (
+                report_id,
+                category,
+                report_json,
+                event_count,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            report_id,
+            category,
+            canonical_json(report_data),
+            len(report_events),
+            time.time()
+        ))
+
+        db.commit()
+
+        return {
+            "success": True,
+            "duplicate": False,
+            "message": "Relatório recebido com sucesso.",
+            "report_id": report_id,
+            "received": len(accepted),
+            "duplicates": duplicate_count,
+            "total_submitted": len(data.events)
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# ÚLTIMO RELATÓRIO
+# =========================================================
+
 @app.get("/api/record/latest")
-async def get_latest_record():
-    return latest_record
+async def latest_record():
+    report = get_latest_report()
+
+    if not report:
+        return {
+            "success": True,
+            "exists": False,
+            "report": None
+        }
+
+    return {
+        "success": True,
+        "exists": True,
+        "report": report
+    }
 
 
-# CONSULTAR O QUE O GEMINI ESTÁ FAZENDO
-@app.get("/api/activity")
-async def get_activity():
-    return activity
+# =========================================================
+# ANALISAR RELATÓRIO COM GEMINI
+# =========================================================
 
-
-# ENVIAR RELATÓRIO PARA O GEMINI
 @app.post("/api/analyze")
-async def analyze(data: AnalyzeRequest, request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+async def analyze_report(data: AnalyzeRequest):
+    report = data.report
 
-    events = data.events if data.events else latest_record["events"]
-    category = data.category if data.events else latest_record["category"]
+    if report is None and data.events:
+        report = {
+            "category": data.category,
+            "events": data.events
+        }
 
-    if not events:
-        raise HTTPException(400, "Nenhum relatório recebido.")
+    if report is None:
+        report = get_latest_report()
 
-    report = json.dumps(events, ensure_ascii=False)
+    if not report:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum relatório disponível para análise."
+        )
 
-    if len(report.encode("utf-8")) > MAX_REPORT_SIZE:
-        raise HTTPException(413, "Relatório muito grande.")
+    report_text = canonical_json(report)
 
-    update_activity(
-        "Analisando",
-        f"Analisando {len(events)} eventos da categoria {category}."
+    if len(report_text) > 30000:
+        report_text = report_text[:30000]
+
+    question = safe_text(data.question)
+
+    prompt = f"""
+Analise o relatório de depuração abaixo.
+
+Objetivos:
+- Explicar o que os eventos indicam.
+- Identificar erros e comportamentos incomuns.
+- Diferenciar fatos observados de hipóteses.
+- Sugerir verificações seguras para o desenvolvedor.
+- Não inventar eventos que não aparecem no relatório.
+
+Pergunta adicional:
+{question or "Faça uma análise geral."}
+
+RELATÓRIO:
+{report_text}
+"""
+
+    answer = await ask_gemini(
+        prompt,
+        system_instruction=(
+            "Você é um assistente de depuração para desenvolvedores "
+            "Roblox. Analise apenas os dados fornecidos e não presuma "
+            "acesso ao jogo ou ao dispositivo."
+        )
     )
 
-    try:
-        answer = await ask_gemini(
-            [{
-                "role": "user",
-                "parts": [{
-                    "text": (
-                        "Analise este relatório do Action Recorder.\n"
-                        f"Categoria: {category}\n"
-                        f"Eventos:\n{report}"
-                    )
-                }]
-            }],
-            INSTRUCTION
-        )
-
-        update_activity("Concluído", answer[:1000])
-
-        return {
-            "success": True,
-            "type": "report",
-            "result": answer,
-            "activity": "Relatório analisado."
-        }
-
-    except Exception as error:
-        update_activity("Erro", str(error))
-        raise
+    return {
+        "success": True,
+        "analysis": answer,
+        "model": GEMINI_MODEL
+    }
 
 
+# =========================================================
 # CHAT COM GEMINI
-@app.post("/api/chat")
-async def chat(data: ChatRequest, request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+# =========================================================
 
-    message = data.message.strip()
+@app.post("/api/chat")
+async def chat(data: ChatRequest):
+    message = safe_text(data.message or data.prompt)
 
     if not message:
-        raise HTTPException(400, "Mensagem vazia.")
-
-    if len(message) > 5000:
-        raise HTTPException(413, "Mensagem muito grande.")
-
-    contents = []
-
-    for item in data.history[-MAX_HISTORY:]:
-        role = item.get("role")
-        text = item.get("text", "")
-
-        if role not in ("user", "model"):
-            continue
-
-        if not isinstance(text, str) or not text.strip():
-            continue
-
-        contents.append({
-            "role": role,
-            "parts": [{"text": text[:5000]}]
-        })
-
-    if data.include_report:
-        if not latest_record["events"]:
-            raise HTTPException(400, "Não existe relatório recebido.")
-
-        report = json.dumps(
-            latest_record["events"],
-            ensure_ascii=False
+        raise HTTPException(
+            status_code=400,
+            detail="Digite uma mensagem."
         )
 
-        contents.append({
-            "role": "user",
-            "parts": [{
-                "text": (
-                    "Considere também este relatório recente:\n"
-                    + report
-                )
-            }]
+    context = ""
+
+    if data.context is not None:
+        context = (
+            "\n\nContexto fornecido:\n"
+            + canonical_json(data.context)[:12000]
+        )
+
+    answer = await ask_gemini(
+        message + context,
+        history=data.history,
+        system_instruction=(
+            "Você é o Gemini integrado ao Nexus Cloud. "
+            "Ajude com programação, depuração e interpretação "
+            "de relatórios de uma experiência Roblox própria. "
+            "Não afirme ter executado ações no jogo. "
+            "Se não houver dados suficientes, explique isso."
+        )
+    )
+
+    return {
+        "success": True,
+        "response": answer,
+        "message": answer,
+        "model": GEMINI_MODEL
+    }
+
+
+# =========================================================
+# ATIVIDADE
+# =========================================================
+
+@app.get("/api/activity")
+async def activity():
+    db = get_db()
+
+    events = db.execute("""
+        SELECT category, event_json, created_at
+        FROM events
+        ORDER BY created_at DESC
+        LIMIT 50
+    """).fetchall()
+
+    total_events = db.execute(
+        "SELECT COUNT(*) FROM events"
+    ).fetchone()[0]
+
+    total_reports = db.execute(
+        "SELECT COUNT(*) FROM reports"
+    ).fetchone()[0]
+
+    db.close()
+
+    result = []
+
+    for row in events:
+        try:
+            event = json.loads(row["event_json"])
+        except Exception:
+            event = row["event_json"]
+
+        result.append({
+            "category": row["category"],
+            "event": event,
+            "created_at": row["created_at"]
         })
 
-    contents.append({
-        "role": "user",
-        "parts": [{"text": message}]
-    })
+    return {
+        "success": True,
+        "total_events": total_events,
+        "total_reports": total_reports,
+        "recent_events": result
+    }
 
-    update_activity("Pensando", "Gemini está respondendo à mensagem.")
 
-    try:
-        answer = await ask_gemini(contents, INSTRUCTION)
+# =========================================================
+# EXECUÇÃO LOCAL
+# =========================================================
 
-        update_activity("Respondido", answer[:1000])
+if __name__ == "__main__":
+    import uvicorn
 
-        return {
-            "success": True,
-            "type": "chat",
-            "result": answer,
-            "activity": "Gemini respondeu."
-        }
-
-    except Exception as error:
-        update_activity("Erro", str(error))
-        raise
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=False
+    )
