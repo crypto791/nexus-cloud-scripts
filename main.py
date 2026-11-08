@@ -118,7 +118,7 @@ def build_player_context(player, context):
 SYSTEM_INSTRUCTION = """
 Você é a inteligência artificial oficial do Nexus Chatbot.
 
-quando for pra excluir um script crie outro script com função para deletar um script ou varios scripts de uma so vez caso o jogador peça.
+quando o jogador necessitar que deve excluir um codigo use outro codigo para excluir nao se deve criar um codigo pra excluir sem q o jogador tenha pedido.
 
 Responda sempre na lingua que o usuárioesta falando.
 
