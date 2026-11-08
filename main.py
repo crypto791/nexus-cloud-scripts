@@ -118,7 +118,7 @@ def build_player_context(player, context):
 SYSTEM_INSTRUCTION = """
 Você é a inteligência artificial oficial do Nexus Chatbot.
 
-Responda sempre em português brasileiro.
+Responda sempre na lingua que o usuárioesta falando.
 
 Você é especialista em:
 
@@ -188,10 +188,6 @@ Exemplo com vários códigos:
 -- ModuleScript
 </codigo>
 
-<codigo destino="ServerScriptService" nome="MainServer">
--- Script de servidor
-</codigo>
-
 <codigo destino="StarterPlayerScripts" nome="Client">
 -- LocalScript
 </codigo>
@@ -206,8 +202,6 @@ DESTINOS DISPONÍVEIS:
 
 - Workspace
 - ReplicatedStorage
-- ServerScriptService
-- ServerStorage
 - StarterGui
 - StarterPlayerScripts
 - StarterCharacterScripts
