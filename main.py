@@ -1,163 +1,123 @@
-"""
-NEXUS CLOUD - Roblox Public Image Search API
-Version: 1.0.0
-
-Install:
-    pip install fastapi uvicorn httpx pydantic
-
-Run:
-    uvicorn main:app --host 0.0.0.0 --port 8000
-
-Render:
-    Build: pip install -r requirements.txt
-    Start: uvicorn main:app --host 0.0.0.0 --port $PORT
-
-Optional environment variable:
-    GEMINI_API_KEY=...
-
-Public Roblox data only. No Roblox cookies, account tokens, private inventories,
-or authenticated account access are used.
-"""
-
-from __future__ import annotations
-
 import os
 import time
 import uuid
+import secrets
 from collections import deque
-from typing import Any, Literal
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.0.0"
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+APP_VERSION = "2.0.0"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+
+TICKET_TTL = int(os.getenv("TICKET_TTL", "604800"))
+MAX_TICKETS = int(os.getenv("MAX_TICKETS", "500"))
+MAX_CODE_LENGTH = 200000
 
 app = FastAPI(
-    title="NEXUS CLOUD API",
-    version=APP_VERSION,
-    description="Public Roblox thumbnails/search plus Nexus reports and Gemini chat.",
+    title="Nexus Cloud API",
+    version=APP_VERSION
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
-HTTP_TIMEOUT = httpx.Timeout(18.0, connect=8.0)
-ROBLOX_HEADERS = {
-    "User-Agent": "NexusCloudPublicAssetSearch/1.0",
-    "Accept": "application/json",
-}
 
-# Small bounded in-memory buffers; they reset when the Render instance restarts.
-REPORTS: deque[dict[str, Any]] = deque(maxlen=1000)
-EVENTS: deque[dict[str, Any]] = deque(maxlen=2000)
-REQUEST_CACHE: dict[str, tuple[float, Any]] = {}
-CACHE_TTL = 90.0
+# ============================================================
+# ARMAZENAMENTO TEMPORÁRIO
+# ============================================================
+
+reports = deque(maxlen=1000)
+tickets = {}
+search_cache = {}
 
 
-class RecordPayload(BaseModel):
-    category: str = Field(default="manual_report", max_length=80)
-    batch_id: str | None = Field(default=None, max_length=100)
-    events: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
-    message: str | None = Field(default=None, max_length=4000)
-    player: str | None = Field(default=None, max_length=64)
-    place_id: int | None = None
+def now():
+    return int(time.time())
 
 
-class ChatPayload(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
-    context: str = Field(default="", max_length=12000)
+def clean_tickets():
+    current = now()
+
+    expired = [
+        ticket_id
+        for ticket_id, ticket in tickets.items()
+        if ticket["expires_at"] <= current
+    ]
+
+    for ticket_id in expired:
+        tickets.pop(ticket_id, None)
 
 
-def _cache_get(key: str) -> Any | None:
-    item = REQUEST_CACHE.get(key)
-    if not item:
-        return None
-    expires, value = item
-    if expires < time.time():
-        REQUEST_CACHE.pop(key, None)
-        return None
-    return value
+def create_ticket_id():
+    for _ in range(20):
+        ticket_id = "ticket_" + str(secrets.randbelow(900000) + 100000)
+
+        if ticket_id not in tickets:
+            return ticket_id
+
+    return "ticket_" + uuid.uuid4().hex[:12]
 
 
-def _cache_set(key: str, value: Any) -> None:
-    if len(REQUEST_CACHE) > 500:
-        now = time.time()
-        for old_key, (expires, _) in list(REQUEST_CACHE.items()):
-            if expires < now:
-                REQUEST_CACHE.pop(old_key, None)
-        if len(REQUEST_CACHE) > 500:
-            REQUEST_CACHE.pop(next(iter(REQUEST_CACHE)), None)
-    REQUEST_CACHE[key] = (time.time() + CACHE_TTL, value)
+# ============================================================
+# MODELOS
+# ============================================================
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=12000)
+    context: Optional[dict] = None
 
 
-async def roblox_get(url: str, params: dict[str, Any] | None = None) -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=ROBLOX_HEADERS) as client:
-        response = await client.get(url, params=params)
-        if response.status_code == 429:
-            raise HTTPException(429, "Roblox limitou temporariamente as consultas. Aguarde e tente novamente.")
-        if response.status_code >= 400:
-            raise HTTPException(502, f"Roblox respondeu HTTP {response.status_code}.")
-        try:
-            return response.json()
-        except ValueError:
-            raise HTTPException(502, "A resposta pública do Roblox não veio em JSON.")
+class RecordRequest(BaseModel):
+    type: str = "event"
+    message: str = ""
+    data: Optional[dict] = None
+    place_id: Optional[int] = None
+    player: Optional[str] = None
 
 
-async def add_asset_thumbnails(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ids = []
-    for item in items:
-        value = item.get("id") or item.get("assetId") or item.get("asset_id")
-        if value is not None and str(value).isdigit():
-            ids.append(str(value))
+class TicketCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=MAX_CODE_LENGTH)
+    name: str = Field(default="Código gerado", max_length=100)
+    place_id: Optional[int] = None
+    owner_tag: Optional[str] = None
 
-    if not ids:
-        return items
 
-    unique_ids = list(dict.fromkeys(ids))[:50]
-    data = await roblox_get(
-        "https://thumbnails.roblox.com/v1/assets",
-        {
-            "assetIds": ",".join(unique_ids),
-            "returnPolicy": "PlaceHolder",
-            "size": "420x420",
-            "format": "Png",
-            "isCircular": "false",
-        },
-    )
-    urls = {
-        str(row.get("targetId")): row.get("imageUrl")
-        for row in data.get("data", [])
-        if row.get("imageUrl")
-    }
-    for item in items:
-        value = item.get("id") or item.get("assetId") or item.get("asset_id")
-        if value is not None:
-            item["image_url"] = urls.get(str(value), item.get("image_url"))
-    return items
+class TicketUpdate(BaseModel):
+    code: Optional[str] = Field(default=None, max_length=MAX_CODE_LENGTH)
+    name: Optional[str] = Field(default=None, max_length=100)
 
+
+# ============================================================
+# ROTAS BÁSICAS
+# ============================================================
 
 @app.get("/")
-async def root():
+async def home():
     return {
-        "service": "NEXUS CLOUD",
+        "name": "Nexus Cloud API",
         "version": APP_VERSION,
-        "status": "online",
-        "endpoints": [
-            "/api/health",
-            "/api/record",
-            "/api/roblox/search",
-            "/api/roblox/asset/{asset_id}",
-            "/api/chat",
-        ],
+        "status": "online"
     }
 
 
@@ -166,306 +126,509 @@ async def health():
     return {
         "success": True,
         "status": "online",
-        "service": "NEXUS CLOUD",
         "version": APP_VERSION,
         "gemini_configured": bool(GEMINI_API_KEY),
-        "public_roblox_search": True,
+        "tickets": len(tickets),
+        "time": now()
     }
 
 
+# ============================================================
+# RELATÓRIOS
+# ============================================================
+
 @app.post("/api/record")
-async def record(payload: RecordPayload):
-    accepted = []
-    now = time.time()
+async def record_event(data: RecordRequest):
+    item = {
+        "id": uuid.uuid4().hex[:12],
+        "type": data.type,
+        "message": data.message[:5000],
+        "data": data.data or {},
+        "place_id": data.place_id,
+        "player": data.player,
+        "timestamp": now()
+    }
 
-    if payload.message:
-        entry = {
-            "id": str(uuid.uuid4()),
-            "received_at": now,
-            "category": payload.category,
-            "message": payload.message,
-            "player": payload.player,
-            "place_id": payload.place_id,
-        }
-        REPORTS.append(entry)
-        accepted.append(entry["id"])
-
-    for event in payload.events:
-        safe_event = {
-            "id": str(event.get("id") or uuid.uuid4()),
-            "received_at": now,
-            "batch_id": payload.batch_id,
-            "category": str(event.get("category", payload.category))[:80],
-            "action": str(event.get("action", ""))[:120],
-            "detail": str(event.get("detail", event.get("message", "")))[:1500],
-        }
-        EVENTS.append(safe_event)
-        accepted.append(safe_event["id"])
-
-    if not accepted and not payload.message and not payload.events:
-        raise HTTPException(400, "Nenhum relatório ou evento foi enviado.")
+    reports.appendleft(item)
 
     return {
         "success": True,
-        "Success": True,
-        "accepted": len(accepted),
-        "ids": accepted,
-        "message": "Relatórios recebidos pelo servidor.",
+        "id": item["id"]
     }
 
 
 @app.get("/api/reports")
-async def get_reports(limit: int = Query(50, ge=1, le=200)):
+async def get_reports(
+    limit: int = Query(default=100, ge=1, le=500),
+    event_type: Optional[str] = None
+):
+    items = list(reports)
+
+    if event_type:
+        items = [
+            item for item in items
+            if item["type"] == event_type
+        ]
+
     return {
         "success": True,
-        "reports": list(REPORTS)[-limit:],
-        "events": list(EVENTS)[-limit:],
+        "count": len(items[:limit]),
+        "reports": items[:limit]
     }
+
+
+@app.delete("/api/reports")
+async def clear_reports():
+    reports.clear()
+
+    return {
+        "success": True,
+        "message": "Relatórios apagados."
+    }
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+@app.post("/api/chat")
+async def chat(data: ChatRequest):
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY não configurada no Render."
+        )
+
+    context_text = ""
+
+    if data.context:
+        context_text = str(data.context)[:12000]
+
+    system_instruction = """
+Você é o assistente Gemini integrado ao Nexus Chatbot.
+
+REGRAS:
+- Responda em português brasileiro.
+- Seja direto e organizado.
+- Quando gerar código, coloque-o dentro de:
+  <codigo>
+  código aqui
+  </codigo>
+- Não diga que executou um código.
+- Não invente resultados de execução.
+- Não solicite senhas, cookies, tokens ou credenciais.
+- Não crie código para roubar contas ou dados.
+- Não ajude a explorar ou atacar jogos de terceiros.
+- Prefira exemplos destinados a experiências próprias
+  e projetos legítimos no Roblox Studio.
+- Explique brevemente a finalidade do código.
+- Se não precisar gerar código, responda normalmente.
+"""
+
+    prompt = f"""
+CONTEXTO DO PAINEL:
+{context_text}
+
+MENSAGEM:
+{data.message}
+"""
+
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {"text": system_instruction}
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 4096
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                GEMINI_URL,
+                params={"key": GEMINI_API_KEY},
+                json=payload
+            )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Erro retornado pelo Gemini.",
+                    "gemini_status": response.status_code,
+                    "response": response.text[:2000]
+                }
+            )
+
+        result = response.json()
+
+        candidates = result.get("candidates", [])
+
+        if not candidates:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini não retornou uma resposta."
+            )
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        reply = "\n".join(
+            part.get("text", "")
+            for part in parts
+            if part.get("text")
+        )
+
+        return {
+            "success": True,
+            "Success": True,
+            "reply": reply,
+            "response": reply,
+            "answer": reply,
+            "model": GEMINI_MODEL
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Tempo limite do Gemini excedido."
+        )
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível conectar ao Gemini."
+        )
+
+
+# ============================================================
+# TICKETS DE CÓDIGO
+# ============================================================
+
+@app.post("/api/tickets")
+async def create_ticket(data: TicketCreate):
+    clean_tickets()
+
+    if len(tickets) >= MAX_TICKETS:
+        raise HTTPException(
+            status_code=503,
+            detail="Limite de tickets atingido."
+        )
+
+    ticket_id = create_ticket_id()
+
+    ticket = {
+        "id": ticket_id,
+        "name": data.name,
+        "code": data.code,
+        "place_id": data.place_id,
+        "owner_tag": data.owner_tag,
+        "created_at": now(),
+        "expires_at": now() + TICKET_TTL
+    }
+
+    tickets[ticket_id] = ticket
+
+    return {
+        "success": True,
+        "ticket": ticket_id,
+        "name": ticket["name"],
+        "expires_at": ticket["expires_at"]
+    }
+
+
+@app.get("/api/tickets")
+async def list_tickets():
+    clean_tickets()
+
+    items = []
+
+    for ticket in tickets.values():
+        items.append({
+            "id": ticket["id"],
+            "name": ticket["name"],
+            "place_id": ticket["place_id"],
+            "created_at": ticket["created_at"],
+            "expires_at": ticket["expires_at"]
+        })
+
+    return {
+        "success": True,
+        "count": len(items),
+        "tickets": items
+    }
+
+
+@app.get("/api/tickets/{ticket_id}")
+async def get_ticket(ticket_id: str):
+    clean_tickets()
+
+    ticket = tickets.get(ticket_id)
+
+    if not ticket:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket não encontrado ou expirado."
+        )
+
+    return {
+        "success": True,
+        "ticket": ticket["id"],
+        "name": ticket["name"],
+        "code": ticket["code"],
+        "place_id": ticket["place_id"],
+        "created_at": ticket["created_at"],
+        "expires_at": ticket["expires_at"]
+    }
+
+
+@app.put("/api/tickets/{ticket_id}")
+async def update_ticket(
+    ticket_id: str,
+    data: TicketUpdate
+):
+    clean_tickets()
+
+    ticket = tickets.get(ticket_id)
+
+    if not ticket:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket não encontrado."
+        )
+
+    if data.code is not None:
+        ticket["code"] = data.code
+
+    if data.name is not None:
+        ticket["name"] = data.name
+
+    return {
+        "success": True,
+        "ticket": ticket_id,
+        "message": "Ticket atualizado."
+    }
+
+
+@app.delete("/api/tickets/{ticket_id}")
+async def delete_ticket(ticket_id: str):
+    clean_tickets()
+
+    if ticket_id not in tickets:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket não encontrado."
+        )
+
+    tickets.pop(ticket_id)
+
+    return {
+        "success": True,
+        "message": "Ticket excluído."
+    }
+
+
+# ============================================================
+# BUSCA PÚBLICA DE ASSETS DO ROBLOX
+# ============================================================
+
+async def roblox_get(url, params=None):
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={
+                    "User-Agent": "NexusCloud/2.0"
+                }
+            )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail="Erro na API pública do Roblox."
+            )
+
+        return response.json()
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível acessar o Roblox."
+        )
 
 
 @app.get("/api/roblox/search")
 async def roblox_search(
-    kind: Literal["icons", "users", "avatars", "games", "assets", "decals"] = "icons",
-    query: str = Query(..., min_length=1, max_length=80),
-    limit: int = Query(20, ge=1, le=30),
+    kind: str = "icons",
+    query: str = Query(default="", max_length=100),
+    limit: int = Query(default=20, ge=1, le=50)
 ):
-    """
-    kinds:
-      icons   -> Roblox public catalog item search (IconFinder remains client-side)
-      users   -> public user search + headshot thumbnails
-      avatars -> same public user search, with avatar headshots
-      games   -> public experience search + game icon thumbnails
-      assets  -> public avatar catalog results + asset thumbnails
-      decals  -> requires a numeric public asset ID; use /api/roblox/asset/{id}
-    """
-    q = query.strip()
-    if not q:
-        raise HTTPException(400, "Digite algo para pesquisar.")
-
-    cache_key = f"search:{kind}:{q.lower()}:{limit}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    if kind in ("users", "avatars"):
-        data = await roblox_get(
-            "https://users.roblox.com/v1/users/search",
-            {"keyword": q, "limit": min(limit, 25)},
+    if not query.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Informe um termo de busca."
         )
-        users = data.get("data", [])
-        ids = [str(user["id"]) for user in users if user.get("id") is not None]
-        thumb_data = {}
-        if ids:
-            thumbs = await roblox_get(
-                "https://thumbnails.roblox.com/v1/users/avatar-headshot",
-                {
-                    "userIds": ",".join(ids),
-                    "size": "150x150",
-                    "format": "Png",
-                    "isCircular": "true",
-                },
-            )
-            thumb_data = {
-                str(row.get("targetId")): row.get("imageUrl")
-                for row in thumbs.get("data", [])
-            }
-        results = [
+
+    kind = kind.lower().strip()
+
+    cache_key = f"{kind}:{query.lower()}:{limit}"
+    cached = search_cache.get(cache_key)
+
+    if cached and cached["expires"] > now():
+        return cached["data"]
+
+    if kind in ("icons", "assets", "decals"):
+        url = "https://catalog.roblox.com/v1/search/items/details"
+
+        params = {
+            "Category": 11,
+            "Keyword": query,
+            "Limit": limit
+        }
+
+        result = await roblox_get(url, params)
+
+        items = []
+
+        for item in result.get("data", []):
+            asset_id = item.get("id")
+
+            if not asset_id:
+                continue
+
+            items.append({
+                "id": asset_id,
+                "name": item.get("name", "Asset"),
+                "description": item.get("description", ""),
+                "creator": item.get("creatorName", ""),
+                "asset_type": item.get("assetType", ""),
+                "url": (
+                    f"https://www.roblox.com/catalog/{asset_id}"
+                ),
+                "thumbnail": (
+                    f"https://www.roblox.com/asset-thumbnail/"
+                    f"image?assetId={asset_id}&width=420&height=420"
+                )
+            })
+
+        output = {
+            "success": True,
+            "kind": kind,
+            "query": query,
+            "count": len(items),
+            "results": items
+        }
+
+    elif kind == "users":
+        url = "https://users.roblox.com/v1/users/search"
+
+        result = await roblox_get(
+            url,
             {
-                "id": user.get("id"),
-                "name": user.get("name"),
-                "display_name": user.get("displayName"),
-                "type": "avatar",
-                "image_url": thumb_data.get(str(user.get("id"))),
-                "profile_url": f"https://www.roblox.com/users/{user.get('id')}/profile",
+                "keyword": query,
+                "limit": limit
             }
-            for user in users
-        ]
-        result = {"success": True, "kind": kind, "query": q, "results": results}
+        )
+
+        output = {
+            "success": True,
+            "kind": kind,
+            "results": result.get("data", [])
+        }
 
     elif kind == "games":
-        data = await roblox_get(
-            "https://games.roblox.com/v1/games/list",
+        url = "https://games.roblox.com/v1/games/list"
+
+        result = await roblox_get(
+            url,
             {
-                "model.keyword": q,
-                "model.maxRows": min(limit, 25),
-                "model.startRows": 0,
-                "model.sortOrder": "Asc",
-            },
-        )
-        games = data.get("Games", data.get("games", []))
-        ids = [str(game.get("UniverseId") or game.get("universeId")) for game in games]
-        ids = [value for value in ids if value and value != "None"]
-        thumb_data = {}
-        if ids:
-            thumbs = await roblox_get(
-                "https://thumbnails.roblox.com/v1/games/icons",
-                {
-                    "universeIds": ",".join(ids[:25]),
-                    "returnPolicy": "PlaceHolder",
-                    "size": "512x512",
-                    "format": "Png",
-                    "isCircular": "false",
-                },
-            )
-            thumb_data = {
-                str(row.get("targetId")): row.get("imageUrl")
-                for row in thumbs.get("data", [])
+                "model.keyword": query,
+                "model.maxRows": limit
             }
-        results = []
-        for game in games:
-            universe_id = game.get("UniverseId") or game.get("universeId")
-            place_id = game.get("PlaceId") or game.get("rootPlaceId")
-            results.append({
-                "id": universe_id,
-                "place_id": place_id,
-                "name": game.get("Name") or game.get("name"),
-                "creator": game.get("Creator", {}).get("Name") if isinstance(game.get("Creator"), dict) else game.get("creatorName"),
-                "type": "game",
-                "image_url": thumb_data.get(str(universe_id)),
-                "url": f"https://www.roblox.com/games/{place_id}" if place_id else None,
-            })
-        result = {"success": True, "kind": kind, "query": q, "results": results}
-
-    elif kind in ("icons", "assets"):
-        # Marketplace catalog search. IconFinder's five Lua icon libraries
-        # are loaded in the LocalScript and are not scraped by this endpoint.
-        data = await roblox_get(
-            "https://catalog.roblox.com/v1/search/items/details",
-            {
-                "Category": 1,
-                "Keyword": q,
-                "Limit": min(limit, 30),
-                "SortType": 0,
-            },
         )
-        rows = data.get("data", [])
-        results = []
-        for row in rows:
-            results.append({
-                "id": row.get("id"),
-                "name": row.get("name"),
-                "type": "asset",
-                "creator": (row.get("creator") or {}).get("name"),
-                "price": row.get("price"),
-                "image_url": None,
-                "url": f"https://www.roblox.com/catalog/{row.get('id')}" if row.get("id") else None,
-            })
-        results = await add_asset_thumbnails(results)
-        result = {"success": True, "kind": kind, "query": q, "results": results}
 
-    else:  # decals
-        if not q.isdigit():
-            raise HTTPException(
-                400,
-                "Para Decals, informe o ID público do asset. A busca por palavra-chave de Decals não está disponível neste endpoint público.",
-            )
-        return await roblox_asset(int(q))
+        output = {
+            "success": True,
+            "kind": kind,
+            "results": result.get("games", [])
+        }
 
-    _cache_set(cache_key, result)
-    return result
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Tipo de busca inválido."
+        )
 
+    search_cache[cache_key] = {
+        "expires": now() + 90,
+        "data": output
+    }
+
+    return output
+
+
+# ============================================================
+# DETALHES DE ASSET
+# ============================================================
 
 @app.get("/api/roblox/asset/{asset_id}")
 async def roblox_asset(asset_id: int):
-    if asset_id < 1:
-        raise HTTPException(400, "ID de asset inválido.")
+    if asset_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="ID inválido."
+        )
 
-    cache_key = f"asset:{asset_id}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+    thumbnail_url = (
+        "https://thumbnails.roblox.com/v1/assets"
+    )
 
-    thumb_data = await roblox_get(
-        "https://thumbnails.roblox.com/v1/assets",
+    thumbnail = await roblox_get(
+        thumbnail_url,
         {
-            "assetIds": str(asset_id),
-            "returnPolicy": "PlaceHolder",
+            "assetIds": asset_id,
             "size": "420x420",
             "format": "Png",
-            "isCircular": "false",
-        },
+            "isCircular": "false"
+        }
     )
-    rows = thumb_data.get("data", [])
-    image_url = rows[0].get("imageUrl") if rows else None
 
-    # Public metadata endpoint; it may reject some asset types.
-    metadata = None
-    try:
-        metadata = await roblox_get(
-            f"https://economy.roblox.com/v2/assets/{asset_id}/details"
-        )
-    except HTTPException:
-        metadata = None
-
-    result = {
+    return {
         "success": True,
-        "kind": "asset",
-        "id": asset_id,
-        "name": metadata.get("Name") if isinstance(metadata, dict) else None,
-        "asset_type_id": metadata.get("AssetTypeId") if isinstance(metadata, dict) else None,
-        "image_url": image_url,
-        "url": f"https://www.roblox.com/library/{asset_id}",
+        "asset_id": asset_id,
+        "url": (
+            f"https://www.roblox.com/catalog/{asset_id}"
+        ),
+        "thumbnail": thumbnail.get("data", [])
     }
-    _cache_set(cache_key, result)
-    return result
 
 
-@app.post("/api/chat")
-async def gemini_chat(payload: ChatPayload):
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            503,
-            "Gemini não configurado. Adicione GEMINI_API_KEY nas variáveis de ambiente do Render.",
-        )
-
-    prompt = payload.message.strip()
-    if not prompt:
-        raise HTTPException(400, "Mensagem vazia.")
-
-    contents = []
-    if payload.context.strip():
-        contents.append({
-            "role": "user",
-            "parts": [{"text": "Contexto de depuração da própria experiência:\n" + payload.context[:12000]}],
-        })
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            response = await client.post(
-                url,
-                json={
-                    "contents": contents,
-                    "generationConfig": {
-                        "temperature": 0.4,
-                        "maxOutputTokens": 1200,
-                    },
-                },
-            )
-        if response.status_code >= 400:
-            raise HTTPException(502, f"Gemini respondeu HTTP {response.status_code}.")
-        data = response.json()
-        candidates = data.get("candidates") or []
-        parts = (
-            candidates[0].get("content", {}).get("parts", [])
-            if candidates else []
-        )
-        reply = "\n".join(
-            part.get("text", "") for part in parts if isinstance(part, dict)
-        ).strip()
-        if not reply:
-            raise HTTPException(502, "Gemini não retornou texto.")
-        return {"success": True, "Success": True, "reply": reply, "model": GEMINI_MODEL}
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Tempo limite ao consultar Gemini.")
-    except httpx.RequestError as exc:
-        raise HTTPException(502, f"Falha de conexão com Gemini: {str(exc)[:200]}")
-
+# ============================================================
+# EXECUÇÃO
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
+    port = int(os.getenv("PORT", "8000"))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
