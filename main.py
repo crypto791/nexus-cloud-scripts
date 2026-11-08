@@ -1,3 +1,4 @@
+
 import os
 import time
 import uuid
@@ -10,24 +11,26 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIG
 # ============================================================
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite"
+)
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
+    + GEMINI_MODEL
+    + ":generateContent"
 )
 
-TICKET_TTL = int(os.getenv("TICKET_TTL", "604800"))
-MAX_TICKETS = int(os.getenv("MAX_TICKETS", "500"))
 MAX_CODE_LENGTH = 200000
+MAX_MESSAGE_LENGTH = 12000
 
 app = FastAPI(
     title="Nexus Cloud API",
@@ -42,9 +45,8 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-
 # ============================================================
-# ARMAZENAMENTO TEMPORÁRIO
+# MEMORY
 # ============================================================
 
 reports = deque(maxlen=1000)
@@ -56,35 +58,27 @@ def now():
     return int(time.time())
 
 
-def clean_tickets():
-    current = now()
-
-    expired = [
-        ticket_id
-        for ticket_id, ticket in tickets.items()
-        if ticket["expires_at"] <= current
-    ]
-
-    for ticket_id in expired:
-        tickets.pop(ticket_id, None)
-
-
 def create_ticket_id():
-    for _ in range(20):
-        ticket_id = "ticket_" + str(secrets.randbelow(900000) + 100000)
+    for _ in range(100):
+        ticket_id = "ticket_" + str(
+            secrets.randbelow(90000000) + 10000000
+        )
 
         if ticket_id not in tickets:
             return ticket_id
 
-    return "ticket_" + uuid.uuid4().hex[:12]
+    return "ticket_" + uuid.uuid4().hex
 
 
 # ============================================================
-# MODELOS
+# MODELS
 # ============================================================
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=12000)
+    message: str = Field(
+        min_length=1,
+        max_length=MAX_MESSAGE_LENGTH
+    )
     context: Optional[dict] = None
 
 
@@ -97,19 +91,31 @@ class RecordRequest(BaseModel):
 
 
 class TicketCreate(BaseModel):
-    code: str = Field(min_length=1, max_length=MAX_CODE_LENGTH)
-    name: str = Field(default="Código gerado", max_length=100)
+    code: str = Field(
+        min_length=1,
+        max_length=MAX_CODE_LENGTH
+    )
+    name: str = Field(
+        default="Código gerado",
+        max_length=100
+    )
     place_id: Optional[int] = None
     owner_tag: Optional[str] = None
 
 
 class TicketUpdate(BaseModel):
-    code: Optional[str] = Field(default=None, max_length=MAX_CODE_LENGTH)
-    name: Optional[str] = Field(default=None, max_length=100)
+    code: Optional[str] = Field(
+        default=None,
+        max_length=MAX_CODE_LENGTH
+    )
+    name: Optional[str] = Field(
+        default=None,
+        max_length=100
+    )
 
 
 # ============================================================
-# ROTAS BÁSICAS
+# HOME / HEALTH
 # ============================================================
 
 @app.get("/")
@@ -127,14 +133,16 @@ async def health():
         "success": True,
         "status": "online",
         "version": APP_VERSION,
+        "model": GEMINI_MODEL,
         "gemini_configured": bool(GEMINI_API_KEY),
         "tickets": len(tickets),
+        "reports": len(reports),
         "time": now()
     }
 
 
 # ============================================================
-# RELATÓRIOS
+# REPORTS
 # ============================================================
 
 @app.post("/api/record")
@@ -193,6 +201,7 @@ async def clear_reports():
 
 @app.post("/api/chat")
 async def chat(data: ChatRequest):
+
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -205,45 +214,55 @@ async def chat(data: ChatRequest):
         context_text = str(data.context)[:12000]
 
     system_instruction = """
-Você é o assistente Gemini integrado ao Nexus Chatbot.
+Você é o assistente de programação do Nexus Chatbot.
+
+Responda em português brasileiro.
+
+Ajude com:
+- Programação Luau.
+- Interfaces Roblox.
+- Sistemas para Roblox Studio.
+- Depuração de scripts.
+- Organização de projetos.
+- Busca e utilização de assets públicos.
+
+Quando gerar código, use exatamente este formato:
+
+<codigo>
+-- código Luau completo
+</codigo>
+
+Não coloque explicações dentro das tags.
 
 REGRAS:
-- Responda em português brasileiro.
-- Seja direto e organizado.
-- Quando gerar código, coloque-o dentro de:
-  <codigo>
-  código aqui
-  </codigo>
-- Não diga que executou um código.
-- Não invente resultados de execução.
-- Não solicite senhas, cookies, tokens ou credenciais.
-- Não crie código para roubar contas ou dados.
-- Não ajude a explorar ou atacar jogos de terceiros.
-- Prefira exemplos destinados a experiências próprias
-  e projetos legítimos no Roblox Studio.
+- Nunca diga que executou um código quando apenas o gerou.
 - Explique brevemente a finalidade do código.
 - Se não precisar gerar código, responda normalmente.
+- Não invente resultados de testes.
 """
 
-    prompt = f"""
-CONTEXTO DO PAINEL:
-{context_text}
-
-MENSAGEM:
-{data.message}
-"""
+    prompt = (
+        "CONTEXTO DO PAINEL:\n"
+        + context_text
+        + "\n\nMENSAGEM DO USUÁRIO:\n"
+        + data.message
+    )
 
     payload = {
         "systemInstruction": {
             "parts": [
-                {"text": system_instruction}
+                {
+                    "text": system_instruction
+                }
             ]
         },
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {"text": prompt}
+                    {
+                        "text": prompt
+                    }
                 ]
             }
         ],
@@ -257,7 +276,9 @@ MENSAGEM:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
+                params={
+                    "key": GEMINI_API_KEY
+                },
                 json=payload
             )
 
@@ -316,18 +337,11 @@ MENSAGEM:
 
 
 # ============================================================
-# TICKETS DE CÓDIGO
+# TICKETS
 # ============================================================
 
 @app.post("/api/tickets")
 async def create_ticket(data: TicketCreate):
-    clean_tickets()
-
-    if len(tickets) >= MAX_TICKETS:
-        raise HTTPException(
-            status_code=503,
-            detail="Limite de tickets atingido."
-        )
 
     ticket_id = create_ticket_id()
 
@@ -337,8 +351,7 @@ async def create_ticket(data: TicketCreate):
         "code": data.code,
         "place_id": data.place_id,
         "owner_tag": data.owner_tag,
-        "created_at": now(),
-        "expires_at": now() + TICKET_TTL
+        "created_at": now()
     }
 
     tickets[ticket_id] = ticket
@@ -347,13 +360,12 @@ async def create_ticket(data: TicketCreate):
         "success": True,
         "ticket": ticket_id,
         "name": ticket["name"],
-        "expires_at": ticket["expires_at"]
+        "created_at": ticket["created_at"]
     }
 
 
 @app.get("/api/tickets")
 async def list_tickets():
-    clean_tickets()
 
     items = []
 
@@ -362,8 +374,7 @@ async def list_tickets():
             "id": ticket["id"],
             "name": ticket["name"],
             "place_id": ticket["place_id"],
-            "created_at": ticket["created_at"],
-            "expires_at": ticket["expires_at"]
+            "created_at": ticket["created_at"]
         })
 
     return {
@@ -375,14 +386,13 @@ async def list_tickets():
 
 @app.get("/api/tickets/{ticket_id}")
 async def get_ticket(ticket_id: str):
-    clean_tickets()
 
     ticket = tickets.get(ticket_id)
 
     if not ticket:
         raise HTTPException(
             status_code=404,
-            detail="Ticket não encontrado ou expirado."
+            detail="Ticket não encontrado."
         )
 
     return {
@@ -391,8 +401,7 @@ async def get_ticket(ticket_id: str):
         "name": ticket["name"],
         "code": ticket["code"],
         "place_id": ticket["place_id"],
-        "created_at": ticket["created_at"],
-        "expires_at": ticket["expires_at"]
+        "created_at": ticket["created_at"]
     }
 
 
@@ -401,7 +410,6 @@ async def update_ticket(
     ticket_id: str,
     data: TicketUpdate
 ):
-    clean_tickets()
 
     ticket = tickets.get(ticket_id)
 
@@ -426,7 +434,6 @@ async def update_ticket(
 
 @app.delete("/api/tickets/{ticket_id}")
 async def delete_ticket(ticket_id: str):
-    clean_tickets()
 
     if ticket_id not in tickets:
         raise HTTPException(
@@ -434,7 +441,7 @@ async def delete_ticket(ticket_id: str):
             detail="Ticket não encontrado."
         )
 
-    tickets.pop(ticket_id)
+    del tickets[ticket_id]
 
     return {
         "success": True,
@@ -443,27 +450,37 @@ async def delete_ticket(ticket_id: str):
 
 
 # ============================================================
-# BUSCA PÚBLICA DE ASSETS DO ROBLOX
+# ROBLOX PUBLIC SEARCH
 # ============================================================
 
 async def roblox_get(url, params=None):
+
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(
                 url,
                 params=params,
                 headers={
-                    "User-Agent": "NexusCloud/2.0"
+                    "User-Agent": "NexusCloud/2.1"
                 }
             )
 
         if response.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail="Erro na API pública do Roblox."
+                detail={
+                    "message": "Erro na API pública do Roblox.",
+                    "status": response.status_code
+                }
             )
 
         return response.json()
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Tempo limite da busca excedido."
+        )
 
     except httpx.RequestError:
         raise HTTPException(
@@ -475,9 +492,17 @@ async def roblox_get(url, params=None):
 @app.get("/api/roblox/search")
 async def roblox_search(
     kind: str = "icons",
-    query: str = Query(default="", max_length=100),
-    limit: int = Query(default=20, ge=1, le=50)
+    query: str = Query(
+        default="",
+        max_length=100
+    ),
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=50
+    )
 ):
+
     if not query.strip():
         raise HTTPException(
             status_code=400,
@@ -486,26 +511,34 @@ async def roblox_search(
 
     kind = kind.lower().strip()
 
-    cache_key = f"{kind}:{query.lower()}:{limit}"
+    cache_key = (
+        f"{kind}:{query.lower()}:{limit}"
+    )
+
     cached = search_cache.get(cache_key)
 
     if cached and cached["expires"] > now():
         return cached["data"]
 
     if kind in ("icons", "assets", "decals"):
-        url = "https://catalog.roblox.com/v1/search/items/details"
 
-        params = {
-            "Category": 11,
-            "Keyword": query,
-            "Limit": limit
-        }
+        url = (
+            "https://catalog.roblox.com/v1/search/items/details"
+        )
 
-        result = await roblox_get(url, params)
+        result = await roblox_get(
+            url,
+            {
+                "Category": 11,
+                "Keyword": query,
+                "Limit": limit
+            }
+        )
 
         items = []
 
         for item in result.get("data", []):
+
             asset_id = item.get("id")
 
             if not asset_id:
@@ -521,7 +554,7 @@ async def roblox_search(
                     f"https://www.roblox.com/catalog/{asset_id}"
                 ),
                 "thumbnail": (
-                    f"https://www.roblox.com/asset-thumbnail/"
+                    "https://www.roblox.com/asset-thumbnail/"
                     f"image?assetId={asset_id}&width=420&height=420"
                 )
             })
@@ -535,10 +568,9 @@ async def roblox_search(
         }
 
     elif kind == "users":
-        url = "https://users.roblox.com/v1/users/search"
 
         result = await roblox_get(
-            url,
+            "https://users.roblox.com/v1/users/search",
             {
                 "keyword": query,
                 "limit": limit
@@ -552,10 +584,9 @@ async def roblox_search(
         }
 
     elif kind == "games":
-        url = "https://games.roblox.com/v1/games/list"
 
         result = await roblox_get(
-            url,
+            "https://games.roblox.com/v1/games/list",
             {
                 "model.keyword": query,
                 "model.maxRows": limit
@@ -583,23 +614,20 @@ async def roblox_search(
 
 
 # ============================================================
-# DETALHES DE ASSET
+# ROBLOX ASSET DETAILS
 # ============================================================
 
 @app.get("/api/roblox/asset/{asset_id}")
 async def roblox_asset(asset_id: int):
+
     if asset_id <= 0:
         raise HTTPException(
             status_code=400,
             detail="ID inválido."
         )
 
-    thumbnail_url = (
-        "https://thumbnails.roblox.com/v1/assets"
-    )
-
-    thumbnail = await roblox_get(
-        thumbnail_url,
+    result = await roblox_get(
+        "https://thumbnails.roblox.com/v1/assets",
         {
             "assetIds": asset_id,
             "size": "420x420",
@@ -614,12 +642,12 @@ async def roblox_asset(asset_id: int):
         "url": (
             f"https://www.roblox.com/catalog/{asset_id}"
         ),
-        "thumbnail": thumbnail.get("data", [])
+        "thumbnail": result.get("data", [])
     }
 
 
 # ============================================================
-# EXECUÇÃO
+# SERVER
 # ============================================================
 
 if __name__ == "__main__":
