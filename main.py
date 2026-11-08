@@ -132,8 +132,8 @@ Você é especialista em:
 - Sistemas de NPCs.
 - Workspace.
 - ReplicatedStorage.
-- ServerScriptService.
-- ServerStorage.
+- ServerScriptService. <-- o caminho foi bloquedo
+- ServerStorage. <-- o caminho foi bloqueado
 - StarterGui.
 - StarterPlayer.
 - Depuração e arquitetura de projetos.
