@@ -1,210 +1,268 @@
 
 import os
 import json
+import time
 import httpx
 
-from fastapi import FastAPI, HTTPException
+from collections import defaultdict
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Action Recorder AI")
+app = FastAPI(title="Nexus Scripts - Gemini Recorder")
 
+# CONFIGURAÇÃO
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    + GEMINI_MODEL
+    + ":generateContent"
+)
+
+MAX_EVENTS = 400
+MAX_REPORT_SIZE = 150000
+MAX_HISTORY = 12
+
+# DADOS EM MEMÓRIA
 latest_record = {
     "category": "Nenhuma",
-    "events": []
+    "events": [],
+    "received_at": None
 }
 
-PAGE = r"""
+activity = {
+    "status": "Aguardando",
+    "message": "O Gemini ainda não recebeu nenhuma solicitação.",
+    "updated_at": None
+}
+
+# Limitação simples de requisições por IP
+request_counts = defaultdict(list)
+
+
+def check_rate_limit(ip, limit=25, window=60):
+    now = time.time()
+
+    request_counts[ip] = [
+        t for t in request_counts[ip]
+        if now - t < window
+    ]
+
+    if len(request_counts[ip]) >= limit:
+        raise HTTPException(
+            429,
+            "Muitas requisições. Aguarde um pouco."
+        )
+
+    request_counts[ip].append(now)
+
+
+class RecordRequest(BaseModel):
+    category: str = "Todos"
+    events: list = Field(default_factory=list)
+
+
+class AnalyzeRequest(BaseModel):
+    category: str = "Todos"
+    events: list = Field(default_factory=list)
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list = Field(default_factory=list)
+    include_report: bool = False
+
+
+def update_activity(status, message):
+    activity["status"] = status
+    activity["message"] = message[:1000]
+    activity["updated_at"] = time.time()
+
+
+def extract_answer(data):
+    candidates = data.get("candidates", [])
+
+    if not candidates:
+        feedback = data.get("promptFeedback", {})
+        reason = feedback.get("blockReason", "Resposta indisponível")
+        raise HTTPException(502, f"Gemini não respondeu: {reason}")
+
+    parts = (
+        candidates[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+
+    answer = "\n".join(
+        part.get("text", "")
+        for part in parts
+        if part.get("text")
+    )
+
+    if not answer:
+        raise HTTPException(502, "Resposta vazia do Gemini.")
+
+    return answer
+
+
+async def ask_gemini(contents, instruction):
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            500,
+            "GEMINI_API_KEY não configurada no Render."
+        )
+
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": instruction}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.6,
+            "maxOutputTokens": 3000
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                GEMINI_URL,
+                params={"key": GEMINI_API_KEY},
+                json=payload
+            )
+
+        if response.status_code != 200:
+            try:
+                error = response.json().get("error", {}).get(
+                    "message", "Erro na API Gemini"
+                )
+            except Exception:
+                error = "Erro na API Gemini"
+
+            raise HTTPException(
+                response.status_code,
+                error[:1000]
+            )
+
+        return extract_answer(response.json())
+
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Gemini demorou para responder.")
+
+    except httpx.RequestError:
+        raise HTTPException(502, "Falha de conexão com Gemini.")
+
+
+INSTRUCTION = """
+Você é o Gemini integrado ao Action Recorder de uma experiência
+Roblox Luau.
+
+Você conversa com o usuário e analisa registros enviados pelo Recorder.
+
+REGRAS:
+- Explique os eventos de maneira organizada.
+- Diferencie fatos observados de hipóteses.
+- Não invente objetos, caminhos ou funções.
+- Não afirme que consegue ler o código interno de scripts
+  apenas pelos registros.
+- Quando receber relatórios, identifique objetos, caminhos,
+  alterações e sequências temporais.
+- Se não houver dados suficientes, diga o que está faltando.
+- Ao escreva codigos solicitados
+  e explique o que o código faz.
+- Responda em português quando o usuário escrever em português.
+"""
+
+
+# PÁGINA SIMPLES PARA TESTAR A API
+PAGE = """
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Action Recorder AI</title>
+<title>Nexus Gemini</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;background:#090b12;color:#e9eaf2;font-family:Arial,sans-serif}
-header{padding:20px;background:#111522;border-bottom:1px solid #252b3b}
-h1{margin:0;font-size:22px;color:#ff4545}
-header p{color:#9299ad;font-size:13px;margin-bottom:0}
-main{max-width:950px;margin:25px auto;padding:0 15px}
-.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:15px}
-button{background:#1b2030;color:#ddd;border:1px solid #30384c;padding:11px 15px;border-radius:8px;cursor:pointer}
-button.active{background:#8d252c;border-color:#ff4545;color:white}
-button:hover{filter:brightness(1.2)}
-.panel{background:#111522;border:1px solid #252b3b;border-radius:12px;padding:17px;margin-bottom:15px}
-h2{font-size:16px;margin-top:0}
-textarea{width:100%;min-height:230px;resize:vertical;background:#090d16;color:#dce3f5;border:1px solid #30384c;border-radius:8px;padding:13px;font-family:monospace;font-size:13px}
-input{width:100%;padding:12px;background:#090d16;color:white;border:1px solid #30384c;border-radius:8px;margin:8px 0}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.primary{background:#a52c35;border-color:#d84952}
-#status{font-size:13px;color:#aab2c7;margin-top:12px}
-#result{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
-.small{color:#8992a8;font-size:12px}
+body{background:#0b0d14;color:#eee;font-family:Arial;margin:0;padding:20px}
+main{max-width:850px;margin:auto}
+h1{color:#ff505d}
+.card{background:#151a27;border:1px solid #30384a;padding:15px;
+border-radius:12px;margin:15px 0}
+textarea{width:100%;box-sizing:border-box;min-height:130px;
+background:#090d16;color:white;border:1px solid #394258;
+border-radius:8px;padding:12px}
+button{background:#a72f3b;color:white;border:0;padding:12px;
+border-radius:8px;margin-top:10px;cursor:pointer}
+#answer{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
+small{color:#9ba5ba}
 </style>
 </head>
 <body>
-<header>
-<h1>ACTION RECORDER AI</h1>
-<p>Registro de eventos Roblox + análise com Gemini</p>
-</header>
-
 <main>
-<div class="tabs">
-<button class="active" onclick="tab('PlayerGui',this)">PlayerGui</button>
-<button onclick="tab('Workspace',this)">Workspace</button>
-<button onclick="tab('Character',this)">Character</button>
-<button onclick="tab('Input',this)">Input</button>
-<button onclick="tab('Todos',this)">Todos</button>
+<h1>NEXUS / GEMINI</h1>
+<small>Action Recorder AI - Painel de teste</small>
+
+<div class="card">
+<h3>Conversa</h3>
+<textarea id="message" placeholder="Digite uma mensagem para o Gemini..."></textarea>
+<br>
+<button onclick="chat()">Enviar mensagem</button>
+<button onclick="report()">Analisar último relatório</button>
 </div>
 
-<section class="panel">
-<h2>Registros capturados</h2>
-<p class="small">Cole aqui os registros do seu Action Recorder ou receba-os pela API.</p>
-<textarea id="logs" placeholder="Os registros aparecerão aqui..."></textarea>
-<div class="actions">
-<button class="primary" onclick="analyze()">Analisar com Gemini</button>
-<button onclick="copyLogs()">Copiar registros</button>
-<button onclick="loadLatest()">Carregar últimos registros</button>
-<button onclick="clearLogs()">Limpar</button>
+<div class="card">
+<h3>Atividade do Gemini</h3>
+<div id="activity">Aguardando...</div>
 </div>
-<div id="status">Aguardando registros.</div>
-</section>
 
-<section class="panel">
-<h2>Resultado da análise</h2>
-<div id="result">A análise aparecerá aqui.</div>
-<div class="actions">
-<button onclick="copyResult()">Copiar resultado</button>
+<div class="card">
+<h3>Resposta</h3>
+<div id="answer">Nenhuma resposta ainda.</div>
 </div>
-</section>
-
-<section class="panel">
-<h2>Como conectar o Recorder</h2>
-<p class="small">
-O endpoint para enviar registros é:
-</p>
-<input id="endpoint" readonly>
-<p class="small">
-Envie um POST com JSON contendo "category" e "events".
-A integração automática deve ser feita pelo servidor da sua própria
-experiência Roblox Studio.
-</p>
-</section>
 </main>
 
 <script>
-let currentTab = "PlayerGui";
-
-document.getElementById("endpoint").value =
-location.origin + "/api/record";
-
-function tab(name, button){
-    currentTab = name;
-    document.querySelectorAll(".tabs button").forEach(b =>
-        b.classList.remove("active")
-    );
-    button.classList.add("active");
-    document.getElementById("status").textContent =
-        "Categoria selecionada: " + name;
+async function chat(){
+ const message=document.getElementById("message").value;
+ if(!message.trim())return;
+ document.getElementById("activity").textContent="Gemini está pensando...";
+ try{
+  const r=await fetch("/api/chat",{
+   method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({message:message})
+  });
+  const d=await r.json();
+  if(!r.ok)throw Error(d.detail||"Erro");
+  document.getElementById("answer").textContent=d.result;
+  document.getElementById("activity").textContent=d.activity;
+ }catch(e){
+  document.getElementById("activity").textContent=e.message;
+ }
 }
 
-async function analyze(){
-    const logs = document.getElementById("logs").value.trim();
-
-    if(!logs){
-        alert("Adicione registros primeiro.");
-        return;
-    }
-
-    const status = document.getElementById("status");
-    const result = document.getElementById("result");
-
-    status.textContent = "Analisando com Gemini...";
-    result.textContent = "Aguarde...";
-
-    try{
-        const response = await fetch("/api/analyze",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({
-                category:currentTab,
-                events:logs
-            })
-        });
-
-        const data = await response.json();
-
-        if(!response.ok){
-            throw new Error(data.detail || "Erro na análise");
-        }
-
-        result.textContent = data.result;
-        status.textContent = "Análise concluída.";
-    }catch(error){
-        status.textContent = "Erro: " + error.message;
-        result.textContent = "Não foi possível analisar os registros.";
-    }
-}
-
-async function loadLatest(){
-    const status = document.getElementById("status");
-
-    try{
-        const response = await fetch("/api/session/latest");
-        const data = await response.json();
-
-        if(!data.events || data.events.length === 0){
-            status.textContent = "Nenhum registro recebido ainda.";
-            return;
-        }
-
-        document.getElementById("logs").value =
-            JSON.stringify(data.events,null,2);
-
-        currentTab = data.category || "Todos";
-        status.textContent = "Últimos registros carregados.";
-    }catch(error){
-        status.textContent = "Erro ao carregar registros.";
-    }
-}
-
-function copyLogs(){
-    navigator.clipboard.writeText(
-        document.getElementById("logs").value
-    );
-}
-
-function copyResult(){
-    navigator.clipboard.writeText(
-        document.getElementById("result").innerText
-    );
-}
-
-function clearLogs(){
-    document.getElementById("logs").value = "";
-    document.getElementById("result").textContent =
-        "A análise aparecerá aqui.";
-    document.getElementById("status").textContent =
-        "Registros limpos.";
+async function report(){
+ document.getElementById("activity").textContent="Analisando relatório...";
+ try{
+  const r=await fetch("/api/analyze",{
+   method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({category:"Todos",events:[]})
+  });
+  const d=await r.json();
+  if(!r.ok)throw Error(d.detail||"Erro");
+  document.getElementById("answer").textContent=d.result;
+  document.getElementById("activity").textContent=d.activity;
+ }catch(e){
+  document.getElementById("activity").textContent=e.message;
+ }
 }
 </script>
 </body>
 </html>
 """
-
-
-class AnalyzeRequest(BaseModel):
-    category: str = "Todos"
-    events: str
-
-
-class RecordRequest(BaseModel):
-    category: str = "Todos"
-    events: list
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -216,118 +274,170 @@ async def home():
 async def health():
     return {
         "status": "online",
-        "gemini_configured": bool(GEMINI_API_KEY)
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "model": GEMINI_MODEL,
+        "has_report": bool(latest_record["events"])
     }
 
 
+# RECEBER RELATÓRIOS DO ROBLOX
 @app.post("/api/record")
-async def receive_record(data: RecordRequest):
+async def receive_record(data: RecordRequest, request: Request):
     global latest_record
 
-    if len(json.dumps(data.events, ensure_ascii=False)) > 200000:
-        raise HTTPException(413, "Registro muito grande.")
+    check_rate_limit(request.client.host if request.client else "unknown")
+
+    if len(data.events) > MAX_EVENTS:
+        raise HTTPException(413, "Limite de eventos excedido.")
+
+    serialized = json.dumps(data.events, ensure_ascii=False)
+
+    if len(serialized.encode("utf-8")) > MAX_REPORT_SIZE:
+        raise HTTPException(413, "Relatório muito grande.")
 
     latest_record = {
         "category": data.category[:40],
-        "events": data.events[-2000:]
+        "events": data.events,
+        "received_at": time.time()
     }
 
     return {
         "success": True,
-        "received": len(latest_record["events"])
+        "received": len(data.events),
+        "message": "Relatório recebido."
     }
 
 
-@app.get("/api/session/latest")
-async def get_latest():
+# CONSULTAR ÚLTIMO RELATÓRIO
+@app.get("/api/record/latest")
+async def get_latest_record():
     return latest_record
 
 
+# CONSULTAR O QUE O GEMINI ESTÁ FAZENDO
+@app.get("/api/activity")
+async def get_activity():
+    return activity
+
+
+# ENVIAR RELATÓRIO PARA O GEMINI
 @app.post("/api/analyze")
-async def analyze(data: AnalyzeRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            500,
-            "Configure GEMINI_API_KEY nas variáveis de ambiente."
-        )
+async def analyze(data: AnalyzeRequest, request: Request):
+    check_rate_limit(request.client.host if request.client else "unknown")
 
-    if len(data.events) > 100000:
-        raise HTTPException(413, "Texto muito grande. Limite: 100 KB.")
+    events = data.events if data.events else latest_record["events"]
+    category = data.category if data.events else latest_record["category"]
 
-    prompt = f"""
-Você é um assistente especializado em análise de registros
-de interfaces e eventos de Roblox Luau.
+    if not events:
+        raise HTTPException(400, "Nenhum relatório recebido.")
 
-Categoria: {data.category}
+    report = json.dumps(events, ensure_ascii=False)
 
-REGISTROS:
-{data.events}
+    if len(report.encode("utf-8")) > MAX_REPORT_SIZE:
+        raise HTTPException(413, "Relatório muito grande.")
 
-Faça uma análise organizada:
-
-1. Explique o que aconteceu.
-2. Identifique os objetos e caminhos envolvidos.
-3. Organize os eventos em ordem.
-4. Diferencie fatos observados de hipóteses.
-5. Se possível, apresente um exemplo Luau seguro
-   para reproduzir os eventos em uma experiência própria.
-6. Não invente propriedades, objetos ou funções que
-   não estejam nos registros.
-
-Não afirme que descobriu o código interno de scripts.
-Os registros representam apenas eventos observados.
-"""
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+    update_activity(
+        "Analisando",
+        f"Analisando {len(events)} eventos da categoria {category}."
     )
 
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
+    try:
+        answer = await ask_gemini(
+            [{
+                "role": "user",
+                "parts": [{
+                    "text": (
+                        "Analise este relatório do Action Recorder.\n"
+                        f"Categoria: {category}\n"
+                        f"Eventos:\n{report}"
+                    )
+                }]
+            }],
+            INSTRUCTION
+        )
+
+        update_activity("Concluído", answer[:1000])
+
+        return {
+            "success": True,
+            "type": "report",
+            "result": answer,
+            "activity": "Relatório analisado."
+        }
+
+    except Exception as error:
+        update_activity("Erro", str(error))
+        raise
+
+
+# CHAT COM GEMINI
+@app.post("/api/chat")
+async def chat(data: ChatRequest, request: Request):
+    check_rate_limit(request.client.host if request.client else "unknown")
+
+    message = data.message.strip()
+
+    if not message:
+        raise HTTPException(400, "Mensagem vazia.")
+
+    if len(message) > 5000:
+        raise HTTPException(413, "Mensagem muito grande.")
+
+    contents = []
+
+    for item in data.history[-MAX_HISTORY:]:
+        role = item.get("role")
+        text = item.get("text", "")
+
+        if role not in ("user", "model"):
+            continue
+
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        contents.append({
+            "role": role,
+            "parts": [{"text": text[:5000]}]
+        })
+
+    if data.include_report:
+        if not latest_record["events"]:
+            raise HTTPException(400, "Não existe relatório recebido.")
+
+        report = json.dumps(
+            latest_record["events"],
+            ensure_ascii=False
+        )
+
+        contents.append({
+            "role": "user",
+            "parts": [{
+                "text": (
+                    "Considere também este relatório recente:\n"
+                    + report
+                )
+            }]
+        })
+
+    contents.append({
+        "role": "user",
+        "parts": [{"text": message}]
+    })
+
+    update_activity("Pensando", "Gemini está respondendo à mensagem.")
 
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                url,
-                params={"key": GEMINI_API_KEY},
-                json=payload
-            )
+        answer = await ask_gemini(contents, INSTRUCTION)
 
-        if response.status_code != 200:
-            raise HTTPException(
-                response.status_code,
-                "Erro retornado pela API Gemini: " +
-                response.text[:1000]
-            )
+        update_activity("Respondido", answer[:1000])
 
-        result_data = response.json()
+        return {
+            "success": True,
+            "type": "chat",
+            "result": answer,
+            "activity": "Gemini respondeu."
+        }
 
-        candidates = result_data.get("candidates", [])
-        if not candidates:
-            raise HTTPException(502, "Gemini não retornou uma resposta.")
-
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        answer = "\n".join(
-            part.get("text", "")
-            for part in parts
-            if part.get("text")
-        )
-
-        if not answer:
-            raise HTTPException(502, "Resposta vazia do Gemini.")
-
-        return {"result": answer}
-
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Gemini demorou demais para responder.")
-    except httpx.RequestError:
-        raise HTTPException(502, "Não foi possível conectar ao Gemini.")
+    except Exception as error:
+        update_activity("Erro", str(error))
+        raise
