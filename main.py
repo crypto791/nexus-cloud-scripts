@@ -221,7 +221,6 @@ Responda em português brasileiro.
 Ajude com:
 - Programação Luau.
 - Interfaces Roblox.
-- Sistemas para Roblox Studio.
 - Depuração de scripts.
 - Organização de projetos.
 - Busca e utilização de assets públicos.
