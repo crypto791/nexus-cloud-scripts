@@ -3,7 +3,7 @@ import os
 import json
 import httpx
 
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 # CONFIG
 # ============================================================
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
+# GEMINI
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 GEMINI_MODEL = os.getenv(
@@ -28,12 +29,37 @@ GEMINI_URL = (
     + ":generateContent"
 )
 
+# OLLAMA CLOUD
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "deepseek-v4.1-flash"
+)
+
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    "https://ollama.com/v1"
+).rstrip("/")
+
+OLLAMA_URL = OLLAMA_BASE_URL + "/chat/completions"
+
+# GENERAL
 MAX_MESSAGE_LENGTH = 12000
 MAX_CONTEXT_LENGTH = 20000
 MAX_OUTPUT_TOKENS = 8192
+MAX_HISTORY = 20
+
+DEFAULT_PROVIDER = os.getenv(
+    "DEFAULT_PROVIDER",
+    "gemini"
+).lower()
+
+if DEFAULT_PROVIDER not in ("gemini", "ollama"):
+    DEFAULT_PROVIDER = "gemini"
 
 app = FastAPI(
-    title="Nexus Gemini API",
+    title="Nexus Multi-AI API",
     version=APP_VERSION
 )
 
@@ -56,14 +82,14 @@ class ChatRequest(BaseModel):
         max_length=MAX_MESSAGE_LENGTH
     )
 
-    # Aceita texto, objeto ou ausência de contexto.
     context: Optional[Any] = None
 
-    # Informações do jogador enviadas pelo LocalScript.
     player: Optional[Any] = None
 
-    # Histórico opcional da conversa.
     history: Optional[list] = None
+
+    # Provedor escolhido pelo jogador.
+    provider: Literal["gemini", "ollama"] = DEFAULT_PROVIDER
 
 
 # ============================================================
@@ -109,6 +135,61 @@ def build_player_context(player, context):
         return "Nenhuma informação adicional foi fornecida."
 
     return "\n\n".join(sections)
+
+
+def build_history(history, provider):
+
+    messages = []
+
+    if not isinstance(history, list):
+        return messages
+
+    for item in history[-MAX_HISTORY:]:
+
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role", "user")
+
+        if role not in ("user", "model", "assistant"):
+            continue
+
+        message_text = item.get(
+            "text",
+            item.get("content", "")
+        )
+
+        if not isinstance(message_text, str):
+            continue
+
+        if not message_text.strip():
+            continue
+
+        if provider == "gemini":
+
+            if role == "assistant":
+                role = "model"
+
+            messages.append({
+                "role": role,
+                "parts": [
+                    {
+                        "text": message_text[:MAX_MESSAGE_LENGTH]
+                    }
+                ]
+            })
+
+        else:
+
+            if role == "model":
+                role = "assistant"
+
+            messages.append({
+                "role": role,
+                "content": message_text[:MAX_MESSAGE_LENGTH]
+            })
+
+    return messages
 
 
 # ============================================================
@@ -268,9 +349,40 @@ organize os códigos em uma arquitetura coerente.
 async def home():
 
     return {
-        "name": "Nexus Gemini API",
+        "name": "Nexus Multi-AI API",
         "version": APP_VERSION,
-        "status": "online"
+        "status": "online",
+        "providers": [
+            "gemini",
+            "ollama"
+        ]
+    }
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+@app.get("/api/config")
+async def get_config():
+
+    return {
+        "success": True,
+        "default_provider": DEFAULT_PROVIDER,
+
+        "providers": {
+            "gemini": {
+                "name": "Google Gemini",
+                "available": bool(GEMINI_API_KEY),
+                "model": GEMINI_MODEL
+            },
+
+            "ollama": {
+                "name": "Ollama Cloud",
+                "available": bool(OLLAMA_API_KEY),
+                "model": OLLAMA_MODEL
+            }
+        }
     }
 
 
@@ -285,62 +397,39 @@ async def health():
         "success": True,
         "status": "online",
         "version": APP_VERSION,
-        "model": GEMINI_MODEL,
-        "gemini_configured": bool(GEMINI_API_KEY)
+
+        "providers": {
+            "gemini": {
+                "configured": bool(GEMINI_API_KEY),
+                "model": GEMINI_MODEL
+            },
+
+            "ollama": {
+                "configured": bool(OLLAMA_API_KEY),
+                "model": OLLAMA_MODEL
+            }
+        }
     }
 
 
 # ============================================================
-# GEMINI CHAT
+# GEMINI PROVIDER
 # ============================================================
 
-@app.post("/api/chat")
-async def chat(data: ChatRequest):
+async def ask_gemini(data, player_context):
 
     if not GEMINI_API_KEY:
+
         raise HTTPException(
             status_code=503,
-            detail="GEMINI_API_KEY não configurada no Render."
+            detail="GEMINI_API_KEY não configurada."
         )
 
-    player_context = build_player_context(
-        data.player,
-        data.context
+    contents = build_history(
+        data.history,
+        "gemini"
     )
 
-    contents = []
-
-    # Histórico opcional.
-    if data.history:
-
-        for item in data.history[-20:]:
-
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role", "user")
-
-            if role not in ("user", "model"):
-                continue
-
-            message_text = item.get("text", "")
-
-            if not isinstance(message_text, str):
-                continue
-
-            if not message_text.strip():
-                continue
-
-            contents.append({
-                "role": role,
-                "parts": [
-                    {
-                        "text": message_text[:MAX_MESSAGE_LENGTH]
-                    }
-                ]
-            })
-
-    # Primeira mensagem ou mensagem atual.
     current_prompt = (
         "INFORMAÇÕES DO AMBIENTE:\n"
         + player_context
@@ -375,105 +464,271 @@ async def chat(data: ChatRequest):
         }
     }
 
-    try:
+    async with httpx.AsyncClient(timeout=90) as client:
 
-        async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            GEMINI_URL,
+            params={
+                "key": GEMINI_API_KEY
+            },
+            json=payload
+        )
 
-            response = await client.post(
-                GEMINI_URL,
-                params={
-                    "key": GEMINI_API_KEY
-                },
-                json=payload
-            )
-
-        if response.status_code != 200:
-
-            try:
-                error_data = response.json()
-            except ValueError:
-                error_data = response.text[:2000]
-
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Erro retornado pelo Gemini.",
-                    "gemini_status": response.status_code,
-                    "response": error_data
-                }
-            )
+    if response.status_code != 200:
 
         try:
-            result = response.json()
+            error_data = response.json()
         except ValueError:
-            raise HTTPException(
-                status_code=502,
-                detail="O Gemini retornou uma resposta inválida."
-            )
+            error_data = response.text[:2000]
 
-        candidates = result.get("candidates", [])
-
-        if not candidates:
-
-            prompt_feedback = result.get(
-                "promptFeedback",
-                {}
-            )
-
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Gemini não retornou uma resposta.",
-                    "feedback": prompt_feedback
-                }
-            )
-
-        candidate = candidates[0]
-
-        parts = (
-            candidate
-            .get("content", {})
-            .get("parts", [])
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Erro retornado pelo Gemini.",
+                "gemini_status": response.status_code,
+                "response": error_data
+            }
         )
 
-        reply = "\n".join(
-            part.get("text", "")
-            for part in parts
-            if isinstance(part, dict) and part.get("text")
+    try:
+        result = response.json()
+    except ValueError:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Resposta inválida do Gemini."
         )
 
-        if not reply:
+    candidates = result.get("candidates", [])
+
+    if not candidates:
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Gemini não retornou uma resposta.",
+                "feedback": result.get("promptFeedback", {})
+            }
+        )
+
+    candidate = candidates[0]
+
+    parts = (
+        candidate
+        .get("content", {})
+        .get("parts", [])
+    )
+
+    reply = "\n".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and part.get("text")
+    )
+
+    if not reply:
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Resposta vazia do Gemini.",
+                "finish_reason": candidate.get("finishReason")
+            }
+        )
+
+    return {
+        "reply": reply,
+        "model": GEMINI_MODEL,
+        "finish_reason": candidate.get("finishReason")
+    }
+
+
+# ============================================================
+# OLLAMA PROVIDER
+# ============================================================
+
+async def ask_ollama(data, player_context):
+
+    if not OLLAMA_API_KEY:
+
+        raise HTTPException(
+            status_code=503,
+            detail="OLLAMA_API_KEY não configurada."
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_INSTRUCTION
+        }
+    ]
+
+    messages.extend(
+        build_history(
+            data.history,
+            "ollama"
+        )
+    )
+
+    current_prompt = (
+        "INFORMAÇÕES DO AMBIENTE:\n"
+        + player_context
+        + "\n\nMENSAGEM ATUAL DO USUÁRIO:\n"
+        + data.message
+    )
+
+    messages.append({
+        "role": "user",
+        "content": current_prompt
+    })
+
+    payload = {
+
+        "model": OLLAMA_MODEL,
+
+        "messages": messages,
+
+        "temperature": 0.7,
+
+        "max_tokens": MAX_OUTPUT_TOKENS,
+
+        "stream": False
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+
+        response = await client.post(
+            OLLAMA_URL,
+
+            headers={
+                "Authorization": "Bearer " + OLLAMA_API_KEY,
+                "Content-Type": "application/json"
+            },
+
+            json=payload
+        )
+
+    if response.status_code != 200:
+
+        try:
+            error_data = response.json()
+        except ValueError:
+            error_data = response.text[:2000]
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Erro retornado pelo Ollama.",
+                "ollama_status": response.status_code,
+                "response": error_data
+            }
+        )
+
+    try:
+        result = response.json()
+    except ValueError:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Resposta inválida do Ollama."
+        )
+
+    choices = result.get("choices", [])
+
+    if not choices:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama não retornou uma resposta."
+        )
+
+    reply = (
+        choices[0]
+        .get("message", {})
+        .get("content", "")
+    )
+
+    if not isinstance(reply, str) or not reply.strip():
+
+        raise HTTPException(
+            status_code=502,
+            detail="A resposta do Ollama veio vazia."
+        )
+
+    return {
+        "reply": reply,
+        "model": OLLAMA_MODEL,
+        "finish_reason": choices[0].get("finish_reason")
+    }
+
+
+# ============================================================
+# CHAT ROUTER
+# ============================================================
+
+@app.post("/api/chat")
+async def chat(data: ChatRequest):
+
+    player_context = build_player_context(
+        data.player,
+        data.context
+    )
+
+    try:
+
+        if data.provider == "gemini":
+
+            result = await ask_gemini(
+                data,
+                player_context
+            )
+
+        elif data.provider == "ollama":
+
+            result = await ask_ollama(
+                data,
+                player_context
+            )
+
+        else:
 
             raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "A resposta do Gemini veio vazia.",
-                    "finish_reason": candidate.get("finishReason")
-                }
+                status_code=400,
+                detail="Provedor de IA inválido."
             )
+
+        reply = result["reply"]
 
         return {
+
             "success": True,
             "Success": True,
+
             "reply": reply,
             "response": reply,
             "answer": reply,
-            "model": GEMINI_MODEL,
-            "finish_reason": candidate.get("finishReason")
+
+            "provider": data.provider,
+
+            "model": result["model"],
+
+            "finish_reason": result["finish_reason"]
         }
+
+    except HTTPException:
+        raise
 
     except httpx.TimeoutException:
 
         raise HTTPException(
             status_code=504,
-            detail="Tempo limite do Gemini excedido."
+            detail="Tempo limite da IA excedido."
         )
 
     except httpx.RequestError:
 
         raise HTTPException(
             status_code=502,
-            detail="Não foi possível conectar ao Gemini."
+            detail="Não foi possível conectar ao provedor de IA."
         )
 
 
