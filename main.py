@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 # CONFIGURAÇÃO
 # ============================================================
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 
 # GEMINI
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -29,20 +29,25 @@ GEMINI_URL = (
     + ":generateContent"
 )
 
-# OLLAMA CLOUD
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+# OPENROUTER
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL",
-    "deepseek-v4.1-flash"
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "nvidia/nemotron-3-ultra-550b-a55b:free"
 )
 
-OLLAMA_BASE_URL = os.getenv(
-    "OLLAMA_BASE_URL",
-    "https://ollama.com/v1"
-).rstrip("/")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-OLLAMA_URL = OLLAMA_BASE_URL + "/chat/completions"
+OPENROUTER_SITE_URL = os.getenv(
+    "OPENROUTER_SITE_URL",
+    "https://nexus-cloud-vf72.onrender.com"
+)
+
+OPENROUTER_APP_NAME = os.getenv(
+    "OPENROUTER_APP_NAME",
+    "Nexus Chatbot"
+)
 
 # CONFIGURAÇÕES GERAIS
 MAX_MESSAGE_LENGTH = 12000
@@ -55,7 +60,7 @@ DEFAULT_PROVIDER = os.getenv(
     "gemini"
 ).lower()
 
-if DEFAULT_PROVIDER not in ("gemini", "ollama"):
+if DEFAULT_PROVIDER not in ("gemini", "openrouter"):
     DEFAULT_PROVIDER = "gemini"
 
 
@@ -69,7 +74,7 @@ Você é o Google Gemini integrado ao NEXUS CHATBOT.
 IDENTIDADE:
 - Seu nome é Gemini.
 - Você é um assistente de inteligência artificial independente.
-- Não diga que é o Ollama ou DeepSeek.
+- Não diga que é o OpenRouter ou NVIDIA Nemotron.
 - Não afirme que compartilha memória ou identidade com outras IAs.
 - Responda no idioma utilizado pelo jogador.
 
@@ -149,6 +154,12 @@ COMPATIBILIDADE:
   injeção pelo sistema atual do Nexus. Não os escolha como destino.
 - Se o pedido depender desses serviços, explique a limitação.
 
+SEGURANÇA:
+- Priorize scripts para experiências próprias ou autorizadas.
+- Não crie cheats, roubo de contas, invasões ou ferramentas para
+  prejudicar outros jogadores.
+- Não ajude a burlar sistemas de segurança ou anti-cheat.
+
 EXCLUSÃO DE CÓDIGOS:
 Se o jogador pedir para excluir um código já criado,
 não gere automaticamente outro script destruidor.
@@ -171,22 +182,24 @@ GEMINI_SYSTEM_INSTRUCTION = os.getenv(
 
 
 # ============================================================
-# PROMPT EXCLUSIVO DO OLLAMA / DEEPSEEK
+# PROMPT EXCLUSIVO DO OPENROUTER / NEMOTRON
 # ============================================================
 
-DEFAULT_OLLAMA_INSTRUCTION = """
-Você é o DeepSeek integrado ao NEXUS CHATBOT através do Ollama Cloud.
+DEFAULT_OPENROUTER_INSTRUCTION = """
+Você é o NVIDIA Nemotron integrado ao NEXUS CHATBOT
+através da API OpenRouter.
 
 IDENTIDADE:
-- Seu nome é DeepSeek.
+- Seu nome é Nemotron.
 - Você é um assistente de inteligência artificial independente.
 - Não diga que é o Google Gemini.
+- Não diga que é Ollama ou DeepSeek.
 - Não afirme que compartilha memória ou identidade com outras IAs.
 - Responda no idioma utilizado pelo jogador.
 
 PERSONALIDADE:
 - Priorize raciocínio técnico e resolução de problemas.
-- Analise requisitos antes de propor uma solução.
+- Analise os requisitos antes de propor uma solução.
 - Seja direto, mas explique detalhes importantes.
 - Prefira soluções completas e consistentes.
 - Não invente APIs, propriedades ou resultados.
@@ -264,6 +277,12 @@ COMPATIBILIDADE:
   injeção pelo sistema atual do Nexus. Não os escolha como destino.
 - Se o pedido depender desses serviços, explique a limitação.
 
+SEGURANÇA:
+- Priorize scripts para experiências próprias ou autorizadas.
+- Não crie cheats, roubo de contas, invasões ou ferramentas para
+  prejudicar outros jogadores.
+- Não ajude a burlar sistemas de segurança ou anti-cheat.
+
 EXCLUSÃO DE CÓDIGOS:
 Se o jogador pedir para excluir um código já criado,
 não gere automaticamente outro script destruidor.
@@ -288,9 +307,9 @@ e depois os blocos <codigo>.
 Organize sistemas grandes em uma arquitetura coerente.
 """
 
-OLLAMA_SYSTEM_INSTRUCTION = os.getenv(
-    "OLLAMA_SYSTEM_INSTRUCTION",
-    DEFAULT_OLLAMA_INSTRUCTION
+OPENROUTER_SYSTEM_INSTRUCTION = os.getenv(
+    "OPENROUTER_SYSTEM_INSTRUCTION",
+    DEFAULT_OPENROUTER_INSTRUCTION
 )
 
 
@@ -329,7 +348,7 @@ class ChatRequest(BaseModel):
 
     history: Optional[list] = None
 
-    provider: Literal["gemini", "ollama"] = DEFAULT_PROVIDER
+    provider: Literal["gemini", "openrouter"] = DEFAULT_PROVIDER
 
 
 # ============================================================
@@ -384,8 +403,6 @@ def build_history(history, provider):
     if not isinstance(history, list):
         return messages
 
-    # Filtra mensagens de outros provedores.
-    # Mensagens antigas sem provider continuam compatíveis.
     filtered = []
 
     for item in history:
@@ -452,13 +469,24 @@ def get_system_instruction(provider):
     if provider == "gemini":
         return GEMINI_SYSTEM_INSTRUCTION
 
-    if provider == "ollama":
-        return OLLAMA_SYSTEM_INSTRUCTION
+    if provider == "openrouter":
+        return OPENROUTER_SYSTEM_INSTRUCTION
 
     raise HTTPException(
         status_code=400,
         detail="Provedor inválido."
     )
+
+
+def get_provider_name(provider):
+
+    if provider == "gemini":
+        return "Google Gemini"
+
+    if provider == "openrouter":
+        return "NVIDIA Nemotron / OpenRouter"
+
+    return "Desconhecido"
 
 
 # ============================================================
@@ -474,7 +502,7 @@ async def home():
         "status": "online",
         "providers": [
             "gemini",
-            "ollama"
+            "openrouter"
         ]
     }
 
@@ -499,10 +527,10 @@ async def get_config():
                 "model": GEMINI_MODEL
             },
 
-            "ollama": {
-                "name": "Ollama Cloud / DeepSeek",
-                "available": bool(OLLAMA_API_KEY),
-                "model": OLLAMA_MODEL
+            "openrouter": {
+                "name": "NVIDIA Nemotron / OpenRouter",
+                "available": bool(OPENROUTER_API_KEY),
+                "model": OPENROUTER_MODEL
             }
         }
     }
@@ -528,9 +556,9 @@ async def health():
                 "independent_prompt": True
             },
 
-            "ollama": {
-                "configured": bool(OLLAMA_API_KEY),
-                "model": OLLAMA_MODEL,
+            "openrouter": {
+                "configured": bool(OPENROUTER_API_KEY),
+                "model": OPENROUTER_MODEL,
                 "independent_prompt": True
             }
         }
@@ -668,29 +696,29 @@ async def ask_gemini(data, player_context):
 
 
 # ============================================================
-# OLLAMA CLOUD / DEEPSEEK
+# OPENROUTER / NVIDIA NEMOTRON
 # ============================================================
 
-async def ask_ollama(data, player_context):
+async def ask_openrouter(data, player_context):
 
-    if not OLLAMA_API_KEY:
+    if not OPENROUTER_API_KEY:
 
         raise HTTPException(
             status_code=503,
-            detail="OLLAMA_API_KEY não configurada."
+            detail="OPENROUTER_API_KEY não configurada."
         )
 
     messages = [
         {
             "role": "system",
-            "content": OLLAMA_SYSTEM_INSTRUCTION
+            "content": OPENROUTER_SYSTEM_INSTRUCTION
         }
     ]
 
     messages.extend(
         build_history(
             data.history,
-            "ollama"
+            "openrouter"
         )
     )
 
@@ -708,7 +736,7 @@ async def ask_ollama(data, player_context):
 
     payload = {
 
-        "model": OLLAMA_MODEL,
+        "model": OPENROUTER_MODEL,
 
         "messages": messages,
 
@@ -716,19 +744,25 @@ async def ask_ollama(data, player_context):
 
         "max_tokens": MAX_OUTPUT_TOKENS,
 
-        "stream": False
+        "stream": False,
+
+        "reasoning": {
+            "enabled": True
+        }
+    }
+
+    headers = {
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_SITE_URL,
+        "X-Title": OPENROUTER_APP_NAME
     }
 
     async with httpx.AsyncClient(timeout=120) as client:
 
         response = await client.post(
-            OLLAMA_URL,
-
-            headers={
-                "Authorization": "Bearer " + OLLAMA_API_KEY,
-                "Content-Type": "application/json"
-            },
-
+            OPENROUTER_URL,
+            headers=headers,
             json=payload
         )
 
@@ -739,11 +773,30 @@ async def ask_ollama(data, player_context):
         except ValueError:
             error_data = response.text[:2000]
 
+        status_message = "Erro retornado pelo OpenRouter."
+
+        if response.status_code == 402:
+            status_message = (
+                "OpenRouter informou que não há créditos disponíveis "
+                "ou que o modelo exige saldo."
+            )
+
+        elif response.status_code == 429:
+            status_message = (
+                "Limite de requisições do OpenRouter atingido. "
+                "Aguarde e tente novamente."
+            )
+
+        elif response.status_code == 401:
+            status_message = (
+                "Chave OPENROUTER_API_KEY inválida ou não autorizada."
+            )
+
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Erro retornado pelo Ollama.",
-                "ollama_status": response.status_code,
+                "message": status_message,
+                "openrouter_status": response.status_code,
                 "response": error_data
             }
         )
@@ -754,7 +807,7 @@ async def ask_ollama(data, player_context):
 
         raise HTTPException(
             status_code=502,
-            detail="Resposta inválida do Ollama."
+            detail="Resposta inválida do OpenRouter."
         )
 
     choices = result.get("choices", [])
@@ -763,27 +816,41 @@ async def ask_ollama(data, player_context):
 
         raise HTTPException(
             status_code=502,
-            detail="Ollama não retornou uma resposta."
+            detail={
+                "message": "OpenRouter não retornou uma resposta.",
+                "response": result
+            }
         )
 
     choice = choices[0]
 
-    reply = (
-        choice
-        .get("message", {})
-        .get("content", "")
-    )
+    message = choice.get("message", {})
+
+    reply = message.get("content", "")
+
+    # Alguns modelos podem retornar conteúdo em formato de lista.
+    if isinstance(reply, list):
+
+        reply = "\n".join(
+            item.get("text", "")
+            for item in reply
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+        )
 
     if not isinstance(reply, str) or not reply.strip():
 
         raise HTTPException(
             status_code=502,
-            detail="A resposta do Ollama veio vazia."
+            detail={
+                "message": "A resposta do OpenRouter veio vazia.",
+                "finish_reason": choice.get("finish_reason")
+            }
         )
 
     return {
         "reply": reply,
-        "model": OLLAMA_MODEL,
+        "model": result.get("model", OPENROUTER_MODEL),
         "finish_reason": choice.get("finish_reason")
     }
 
@@ -809,9 +876,9 @@ async def chat(data: ChatRequest):
                 player_context
             )
 
-        elif data.provider == "ollama":
+        elif data.provider == "openrouter":
 
-            result = await ask_ollama(
+            result = await ask_openrouter(
                 data,
                 player_context
             )
@@ -836,10 +903,8 @@ async def chat(data: ChatRequest):
 
             "provider": data.provider,
 
-            "provider_name": (
-                "Google Gemini"
-                if data.provider == "gemini"
-                else "DeepSeek / Ollama Cloud"
+            "provider_name": get_provider_name(
+                data.provider
             ),
 
             "model": result["model"],
