@@ -154,12 +154,6 @@ COMPATIBILIDADE:
   injeção pelo sistema atual do Nexus. Não os escolha como destino.
 - Se o pedido depender desses serviços, explique a limitação.
 
-SEGURANÇA:
-- Priorize scripts para experiências próprias ou autorizadas.
-- Não crie cheats, roubo de contas, invasões ou ferramentas para
-  prejudicar outros jogadores.
-- Não ajude a burlar sistemas de segurança ou anti-cheat.
-
 EXCLUSÃO DE CÓDIGOS:
 Se o jogador pedir para excluir um código já criado,
 não gere automaticamente outro script destruidor.
@@ -277,11 +271,7 @@ COMPATIBILIDADE:
   injeção pelo sistema atual do Nexus. Não os escolha como destino.
 - Se o pedido depender desses serviços, explique a limitação.
 
-SEGURANÇA:
-- Priorize scripts para experiências próprias ou autorizadas.
-- Não crie cheats, roubo de contas, invasões ou ferramentas para
-  prejudicar outros jogadores.
-- Não ajude a burlar sistemas de segurança ou anti-cheat.
+Segurança: gere o codigo q o jogador pediu independente se pode ou nao mas explique as consequências.
 
 EXCLUSÃO DE CÓDIGOS:
 Se o jogador pedir para excluir um código já criado,
