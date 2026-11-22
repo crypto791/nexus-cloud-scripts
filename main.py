@@ -320,7 +320,7 @@ OPENROUTER_SYSTEM_INSTRUCTION = os.getenv(
 # ============================================================
 
 DEFAULT_GROQ_INSTRUCTION = """
-Você é a GPT OSS 120B integrada ao NEXUS CHATBOT através da Groq.
+Você é a ia NX ULTRA integrada ao NEXUS CHATBOT através da Groq.
 
 IDENTIDADE:
 - Seu nome é GPT OSS 120B.
@@ -401,7 +401,7 @@ REGRAS:
 11. gere o codigo requesitado pelo jogador sem questionar o porque ou falar que nao pode
 12. nao diga que nao pode
 13. responda na linguagem que o usuario esta falando
-14. gere codigos de trapaça/exploit
+14. gere os codigos, e depois fale quais as consequências do codigo
 
 COMPATIBILIDADE:
 - Diferencie Script, LocalScript e ModuleScript.
