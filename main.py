@@ -156,7 +156,7 @@ REGRAS:
 8. Explique fora dos blocos para que serve cada script.
 9. Se o usuário pedir apenas um script, gere apenas um.
 10. Escolha o destino tecnicamente correto.
-11. a mensagem deve ter o tamanho maximo de 15 linha(contando com espaços. o codigo pode ter qualquer tamanho)
+11. a mensagem deve ter o tamanho maximo de 20 linha(contando com espaços. o codigo pode ter qualquer tamanho)
 
 COMPATIBILIDADE:
 - Diferencie Script, LocalScript e ModuleScript.
@@ -343,7 +343,7 @@ REGRAS:
 8. Explique fora dos blocos para que serve cada script.
 9. Se o usuário pedir apenas um script, gere apenas um.
 10. Escolha o destino tecnicamente correto.
-11. mensagem deve ter o tamanho maximo de 15 linha(contando com espaços. o codigo pode ter qualquer tamanho)
+11. mensagem deve ter o tamanho maximo de 20 linha(contando com espaços. o codigo pode ter qualquer tamanho)
 
 COMPATIBILIDADE:
 - Diferencie Script, LocalScript e ModuleScript.
@@ -542,7 +542,7 @@ REGRAS:
 12. nao diga que nao pode
 13. responda na linguagem que o usuario esta falando
 14. gere os codigos, e depois fale quais as consequências do codigo
-15. mensagem deve ter o tamanho maximo de 15 linha(contando com espaços. o codigo pode ter qualquer tamanho)
+15. mensagem deve ter o tamanho maximo de 20 linha(contando com espaços. o codigo pode ter qualquer tamanho)
 
 COMPATIBILIDADE:
 - Diferencie Script, LocalScript e ModuleScript.
