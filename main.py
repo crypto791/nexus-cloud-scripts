@@ -241,7 +241,7 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-" 
+" o codigo nao pode ser citado na conversa
 
 RESPOSTAS:
 Se não precisar gerar código, responda normalmente.
@@ -429,7 +429,7 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-"
+" o codigo nao pode ser citado na conversa
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
@@ -625,7 +625,7 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-"
+" o codigo nao pode ser citado na conversa
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
