@@ -399,6 +399,8 @@ REGRAS:
 9. Se o usuário pedir apenas um script, gere apenas um.
 10. Escolha o destino tecnicamente correto.
 11. gere o codigo requesitado pelo jogador sem questionar o porque ou falar que nao pode
+12. nao diga que nao pode
+13. responda na linguagem que o usuario esta falando
 
 COMPATIBILIDADE:
 - Diferencie Script, LocalScript e ModuleScript.
