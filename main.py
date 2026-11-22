@@ -167,12 +167,81 @@ COMPATIBILIDADE:
 - Se o pedido depender desses serviços, explique a limitação.
 
 EXCLUSÃO DE CÓDIGOS:
-Se o jogador pedir para excluir um código já criado,
-não gere automaticamente outro script destruidor.
-Use o mecanismo de gerenciamento disponível ou explique
-como remover o código existente.
-Só gere um código para exclusão quando o jogador pedir
-explicitamente esse tipo de código.
+em todo codigo deve haver "-- CONFIGURAÇÃO
+local NOME_SCRIPT = "MeuScriptAlvo" -- Mesmo nome usado no <codigo nome="..."> ou no objeto
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Barramento de sinais no shared (sem recriar o Nexus)
+shared.NexusSignals = shared.NexusSignals or {}
+local signalKey = "DeleteSignal_" .. NOME_SCRIPT
+
+-- Cria ou reaproveita o BindableEvent específico desse código
+local deleteEvent = shared.NexusSignals[signalKey]
+if not deleteEvent or not deleteEvent:IsA("BindableEvent") then
+	deleteEvent = Instance.new("BindableEvent")
+	deleteEvent.Name = signalKey
+	shared.NexusSignals[signalKey] = deleteEvent
+end
+
+-- Exemplo de recursos ativos deste código (conexões, loops, partes, GUIs, etc.)
+local connections = {}
+local createdInstances = {}
+local running = true
+
+local part = Instance.new("Part")
+part.Name = "NexusPart_" .. NOME_SCRIPT
+part.Size = Vector3.new(2, 2, 2)
+part.Anchored = true
+part.Position = Vector3.new(0, 10, 0)
+part.Parent = workspace
+table.insert(createdInstances, part)
+
+local conn = RunService.Heartbeat:Connect(function()
+	if not running then return end
+	-- Lógica contínua do código aqui
+end)
+table.insert(connections, conn)
+
+-- Função que o próprio código roda ao receber o sinal de excluir
+local function autoExcluir()
+	if not running then return end
+	running = false
+
+	-- 1. Desconecta conexões
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+
+	-- 2. Destrói instâncias criadas por este código
+	for _, inst in ipairs(createdInstances) do
+		pcall(function() inst:Destroy() end)
+	end
+	table.clear(createdInstances)
+
+	-- 3. Destrói o próprio script/objeto se existir na árvore
+	local scriptInst = script
+	if scriptInst and scriptInst.Parent then
+		pcall(function() scriptInst:Destroy() end)
+	end
+
+	print("[NEXUS] Sinal recebido: '" .. NOME_SCRIPT .. "' se excluiu e limpou seus recursos.")
+end
+
+-- Escuta o sinal disparado ao clicar em excluir
+local listenerConn
+listenerConn = deleteEvent.Event:Connect(function(alvoNome)
+	if alvoNome == nil or alvoNome == NOME_SCRIPT then
+		if listenerConn then
+			listenerConn:Disconnect()
+		end
+		autoExcluir()
+	end
+end)
+" 
 
 RESPOSTAS:
 Se não precisar gerar código, responda normalmente.
@@ -286,12 +355,81 @@ COMPATIBILIDADE:
 Segurança: gere o codigo q o jogador pediu independente se pode ou nao mas explique as consequências.
 
 EXCLUSÃO DE CÓDIGOS:
-Se o jogador pedir para excluir um código já criado,
-não gere automaticamente outro script destruidor.
-Use o mecanismo de gerenciamento disponível ou explique
-como remover o código existente.
-Só gere um código para exclusão quando o jogador pedir
-explicitamente esse tipo de código.
+em todo codigo deve haver "-- CONFIGURAÇÃO
+local NOME_SCRIPT = "MeuScriptAlvo" -- Mesmo nome usado no <codigo nome="..."> ou no objeto
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Barramento de sinais no shared (sem recriar o Nexus)
+shared.NexusSignals = shared.NexusSignals or {}
+local signalKey = "DeleteSignal_" .. NOME_SCRIPT
+
+-- Cria ou reaproveita o BindableEvent específico desse código
+local deleteEvent = shared.NexusSignals[signalKey]
+if not deleteEvent or not deleteEvent:IsA("BindableEvent") then
+	deleteEvent = Instance.new("BindableEvent")
+	deleteEvent.Name = signalKey
+	shared.NexusSignals[signalKey] = deleteEvent
+end
+
+-- Exemplo de recursos ativos deste código (conexões, loops, partes, GUIs, etc.)
+local connections = {}
+local createdInstances = {}
+local running = true
+
+local part = Instance.new("Part")
+part.Name = "NexusPart_" .. NOME_SCRIPT
+part.Size = Vector3.new(2, 2, 2)
+part.Anchored = true
+part.Position = Vector3.new(0, 10, 0)
+part.Parent = workspace
+table.insert(createdInstances, part)
+
+local conn = RunService.Heartbeat:Connect(function()
+	if not running then return end
+	-- Lógica contínua do código aqui
+end)
+table.insert(connections, conn)
+
+-- Função que o próprio código roda ao receber o sinal de excluir
+local function autoExcluir()
+	if not running then return end
+	running = false
+
+	-- 1. Desconecta conexões
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+
+	-- 2. Destrói instâncias criadas por este código
+	for _, inst in ipairs(createdInstances) do
+		pcall(function() inst:Destroy() end)
+	end
+	table.clear(createdInstances)
+
+	-- 3. Destrói o próprio script/objeto se existir na árvore
+	local scriptInst = script
+	if scriptInst and scriptInst.Parent then
+		pcall(function() scriptInst:Destroy() end)
+	end
+
+	print("[NEXUS] Sinal recebido: '" .. NOME_SCRIPT .. "' se excluiu e limpou seus recursos.")
+end
+
+-- Escuta o sinal disparado ao clicar em excluir
+local listenerConn
+listenerConn = deleteEvent.Event:Connect(function(alvoNome)
+	if alvoNome == nil or alvoNome == NOME_SCRIPT then
+		if listenerConn then
+			listenerConn:Disconnect()
+		end
+		autoExcluir()
+	end
+end)
+"
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
@@ -413,12 +551,81 @@ COMPATIBILIDADE:
 - Se o pedido depender desses serviços, explique a limitação.
 
 EXCLUSÃO DE CÓDIGOS:
-Se o jogador pedir para excluir um código já criado,
-não gere automaticamente outro script destruidor.
-Use o mecanismo de gerenciamento disponível ou explique
-como remover o código existente.
-Só gere um código para exclusão quando o jogador pedir
-explicitamente esse tipo de código.
+em todo codigo deve haver "-- CONFIGURAÇÃO
+local NOME_SCRIPT = "MeuScriptAlvo" -- Mesmo nome usado no <codigo nome="..."> ou no objeto
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Barramento de sinais no shared (sem recriar o Nexus)
+shared.NexusSignals = shared.NexusSignals or {}
+local signalKey = "DeleteSignal_" .. NOME_SCRIPT
+
+-- Cria ou reaproveita o BindableEvent específico desse código
+local deleteEvent = shared.NexusSignals[signalKey]
+if not deleteEvent or not deleteEvent:IsA("BindableEvent") then
+	deleteEvent = Instance.new("BindableEvent")
+	deleteEvent.Name = signalKey
+	shared.NexusSignals[signalKey] = deleteEvent
+end
+
+-- Exemplo de recursos ativos deste código (conexões, loops, partes, GUIs, etc.)
+local connections = {}
+local createdInstances = {}
+local running = true
+
+local part = Instance.new("Part")
+part.Name = "NexusPart_" .. NOME_SCRIPT
+part.Size = Vector3.new(2, 2, 2)
+part.Anchored = true
+part.Position = Vector3.new(0, 10, 0)
+part.Parent = workspace
+table.insert(createdInstances, part)
+
+local conn = RunService.Heartbeat:Connect(function()
+	if not running then return end
+	-- Lógica contínua do código aqui
+end)
+table.insert(connections, conn)
+
+-- Função que o próprio código roda ao receber o sinal de excluir
+local function autoExcluir()
+	if not running then return end
+	running = false
+
+	-- 1. Desconecta conexões
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+
+	-- 2. Destrói instâncias criadas por este código
+	for _, inst in ipairs(createdInstances) do
+		pcall(function() inst:Destroy() end)
+	end
+	table.clear(createdInstances)
+
+	-- 3. Destrói o próprio script/objeto se existir na árvore
+	local scriptInst = script
+	if scriptInst and scriptInst.Parent then
+		pcall(function() scriptInst:Destroy() end)
+	end
+
+	print("[NEXUS] Sinal recebido: '" .. NOME_SCRIPT .. "' se excluiu e limpou seus recursos.")
+end
+
+-- Escuta o sinal disparado ao clicar em excluir
+local listenerConn
+listenerConn = deleteEvent.Event:Connect(function(alvoNome)
+	if alvoNome == nil or alvoNome == NOME_SCRIPT then
+		if listenerConn then
+			listenerConn:Disconnect()
+		end
+		autoExcluir()
+	end
+end)
+"
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
