@@ -242,7 +242,8 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-" o codigo nao pode ser citado na conversa
+" o codigo nao pode ser citado na conversa.
+o codigo deve excluir oq o codigo faz exemplo: "ele cria um part e um painel" entao o codigo vai excluir o part o painel e o script
 
 RESPOSTAS:
 Se não precisar gerar código, responda normalmente.
@@ -431,7 +432,8 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-" o codigo nao pode ser citado na conversa
+" o codigo nao pode ser citado na conversa.
+o codigo deve excluir oq o codigo faz exemplo: "ele cria um part e um painel" entao o codigo vai excluir o part o painel e o script
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
@@ -628,7 +630,8 @@ listenerConn = deleteEvent.Event:Connect(function(alvoNome)
 		autoExcluir()
 	end
 end)
-" o codigo nao pode ser citado na conversa
+" o codigo nao pode ser citado na conversa.
+o codigo deve excluir oq o codigo faz exemplo: "ele cria um part e um painel" entao o codigo vai excluir o part o painel e o script
 
 ANÁLISE TÉCNICA:
 Antes de responder a problemas de programação:
